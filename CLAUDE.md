@@ -1,13 +1,13 @@
 # AegisFlow
 
 Local-first runtime for deterministic, resumable, auditable refund workflow runs.
-Python 3.11+, FastAPI, Pydantic v2, SQLite. All code lives in `backend/`.
+Python 3.11+, FastAPI, Pydantic v2, SQLite in `backend/`. React + TypeScript + Vite UI in `frontend/`. Deployed as one Render free service (`render.yaml`).
 
 - `aegisflow/engine.py`: run state machine (`start_run`, `advance`, `approve`, `reject`) and reads.
 - `aegisflow/planner.py`: pure next-step and approval-gate decisions over a fixed `PIPELINE`.
 - `aegisflow/tools.py`: deterministic mock tools and data (`ORDERS`, `CUSTOMERS`); no external APIs.
 - `aegisflow/db.py`: schema, migrations, `connect()`, `tx()`. `aegisflow/models.py`: Pydantic I/O models.
-- `aegisflow/api.py`: thin HTTP layer over the engine.
+- `aegisflow/api.py`: thin HTTP layer over the engine. `create_app` is the API; `create_site` (production) mounts it at `/api` and serves `frontend/dist` at `/`. The UI always calls `/api`; in development, Vite proxies it to `:8000`.
 
 ## Commands (PowerShell, from `backend/`)
 
@@ -18,7 +18,7 @@ The `python` on PATH has no project dependencies; always use the venv interprete
     .venv\Scripts\python.exe -m pytest tests/test_retries.py -q
     .venv\Scripts\python.exe -m uvicorn aegisflow.api:create_app --factory
 
-The API uses the SQLite file in `AEGISFLOW_DB` (default `aegisflow.db` in the current directory).
+The API uses the SQLite file in `AEGISFLOW_DB` (default `aegisflow.db` in the current directory). Frontend, from `frontend/`: `npm run dev`; `npm run build` type-checks and builds.
 
 ## Invariants
 

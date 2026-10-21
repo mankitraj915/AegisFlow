@@ -1,3 +1,9 @@
+import pytest
+from fastapi.testclient import TestClient
+
+from aegisflow.api import create_app, create_site
+
+
 def create(client, order_id, **scenario):
     r = client.post("/runs", json={"order_id": order_id, "scenario": scenario})
     assert r.status_code == 201, r.text
@@ -59,3 +65,49 @@ def test_error_contract(client):
     run = create(client, "ORD-2002")
     assert client.post(f"/runs/{run['id']}/approve", json={}).status_code == 422
     assert create(client, "ORD-9009")["status"] == "failed"
+
+
+def test_health(client):
+    assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_run_cap_bounds_public_demo(db_path):
+    client = TestClient(create_app(db_path, max_runs=2))
+    create(client, "ORD-1001")
+    create(client, "ORD-2002")
+    r = client.post("/runs", json={"order_id": "ORD-1001"})
+    assert r.status_code == 429 and "limited to 2 runs" in r.json()["detail"]
+    assert len(client.get("/runs").json()) == 2
+    # Existing runs stay fully usable at the cap.
+    run_id = client.get("/runs").json()[1]["id"]
+    assert client.post(f"/runs/{run_id}/approve", json={"decided_by": "ops"}).json()["status"] == "succeeded"
+
+
+def test_input_bounds(client):
+    assert client.post("/runs", json={"order_id": "X" * 65}).status_code == 422
+    r = client.post("/runs", json={"order_id": "ORD-1001", "scenario": {"faults": {"fetch_order": ["fatal"] * 11}}})
+    assert r.status_code == 422
+    run = create(client, "ORD-2002")
+    assert client.post(f"/runs/{run['id']}/approve", json={"decided_by": "x" * 101}).status_code == 422
+    assert client.post(f"/runs/{run['id']}/reject", json={"decided_by": "ops", "reason": "r" * 501}).status_code == 422
+    assert client.get(f"/runs/{run['id']}").json()["status"] == "awaiting_approval"
+
+
+def test_site_serves_frontend_and_api_on_one_origin(db_path, tmp_path):
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text("<div id=root></div>")
+    (dist / "assets" / "app.js").write_text("console.log(1)")
+    site = TestClient(create_site(db_path, str(dist)))
+    assert site.get("/").text == "<div id=root></div>"
+    assert site.get("/assets/app.js").status_code == 200
+    assert site.get("/api/health").json() == {"status": "ok"}
+    r = site.post("/api/runs", json={"order_id": "ORD-1001"})
+    assert r.status_code == 201 and r.json()["status"] == "succeeded"
+    assert site.get(f"/api/runs/{r.json()['id']}/events").status_code == 200
+    assert site.get("/api/runs/nope").status_code == 404
+
+
+def test_site_refuses_to_start_without_frontend_build(db_path, tmp_path):
+    with pytest.raises(RuntimeError, match="frontend build not found"):
+        create_site(db_path, str(tmp_path / "missing"))

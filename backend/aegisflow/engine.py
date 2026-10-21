@@ -276,6 +276,10 @@ def get_run(conn, run_id: str) -> RunOut:
     return _run_out(_get_run(conn, run_id))
 
 
+def count_runs(conn) -> int:
+    return conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+
+
 def list_runs(conn) -> list[RunOut]:
     return [_run_out(r) for r in conn.execute("SELECT * FROM runs ORDER BY created_at, rowid")]
 

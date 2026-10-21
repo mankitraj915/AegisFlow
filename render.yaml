@@ -1,0 +1,17 @@
+# Render Blueprint: one free web service. FastAPI serves the API under /api and
+# the built frontend at /. SQLite lives on the service's ephemeral disk, so data
+# resets on every deploy, restart and idle spin-down.
+services:
+  - type: web
+    name: aegisflow
+    runtime: python
+    plan: free
+    # Editable install keeps the package next to frontend/dist, which create_site serves.
+    buildCommand: pip install -e ./backend && npm ci --prefix frontend && npm run build --prefix frontend
+    startCommand: uvicorn aegisflow.api:create_site --factory --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.15
+      - key: AEGISFLOW_MAX_RUNS
+        value: "500"

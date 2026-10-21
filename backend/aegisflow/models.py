@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -14,7 +14,7 @@ class Scenario(BaseModel):
     require_manual_review: bool = False
     # Deterministic fault injection: step name -> outcome of attempts 1..n.
     # Attempts beyond the list run normally.
-    faults: dict[str, list[FaultKind]] = Field(default_factory=dict)
+    faults: dict[str, Annotated[list[FaultKind], Field(max_length=10)]] = Field(default_factory=dict)
 
     @field_validator("faults")
     @classmethod
@@ -26,13 +26,13 @@ class Scenario(BaseModel):
 
 
 class CreateRun(BaseModel):
-    order_id: str
+    order_id: str = Field(max_length=64)
     scenario: Scenario = Field(default_factory=Scenario)
 
 
 class Decision(BaseModel):
-    decided_by: str = Field(min_length=1)
-    reason: str | None = None
+    decided_by: str = Field(min_length=1, max_length=100)
+    reason: str | None = Field(None, max_length=500)
 
 
 class RunOut(BaseModel):

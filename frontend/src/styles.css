@@ -207,4 +207,16 @@ td.retried { color: var(--warn-fg); font-weight: 600; }
 .event details summary { cursor: pointer; color: var(--muted); margin-top: 2px; }
 pre { margin: 6px 0 0; padding: 8px; background: var(--bg); border-radius: 4px; overflow-x: auto; font-size: 12px; }
 
-.empty-detail { display: grid; place-items: center; min-height: 160px; }
+.notice {
+  margin: 0;
+  padding: 8px 16px;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.guide p { margin: 8px 0 0; max-width: 70ch; }
+.guide h3 { margin: 16px 0 0; }
+.guide ul { margin: 8px 0 0; padding-left: 20px; max-width: 70ch; }
+.guide li + li { margin-top: 6px; }
