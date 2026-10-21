@@ -3,11 +3,25 @@
 Recovery model: advance() is re-entrant. State is rebuilt from succeeded steps;
 a step left in 'started' (crash between tool call and completion) is resumed
 with the same idempotency key rather than re-inserted.
+
+Retries: a RetryableToolError keeps the step 'started' and bumps steps.attempt
+(with a step_attempt_failed event) before a deterministic backoff, so every
+attempt reuses the step's idempotency key. A crash mid-attempt re-executes the
+same attempt number; a crash during backoff resumes at the next one. Crashes
+therefore do not consume retry budget; only recorded tool failures do.
+
+Concurrency: advance() for one run is only reached by start_run (on a run id
+no one else has yet) and by the single winner of the conditional approval
+transition, so no application path runs two advance() calls on the same run.
+Direct concurrent callers are not guarded against duplicate tool execution;
+side effects stay exactly-once only through the ledger's idempotency key.
 """
 import json
 import sqlite3
+import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from . import planner, tools
 from .db import now, tx
@@ -17,6 +31,21 @@ from .models import (
 
 # Test seam: called as hook(point, step_name) at named crash windows.
 Hook = Callable[[str, str], None]
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    max_attempts: int = 3
+    base_delay_s: float = 0.1
+    max_delay_s: float = 2.0
+
+    def delay(self, attempt: int) -> float:
+        """Backoff after failed attempt `attempt`. Exponential, capped, no jitter."""
+        return min(self.base_delay_s * 2 ** (attempt - 1), self.max_delay_s)
+
+
+RETRY_POLICY = RetryPolicy()
+_sleep = time.sleep  # Test seam: replaced so tests never really wait.
 
 
 class RunNotFound(Exception):
@@ -91,10 +120,12 @@ def advance(conn, run_id: str, hook: Hook | None = None) -> str:
         state = _load_state(conn, run)
 
         pending = conn.execute(
-            "SELECT idx, name, idempotency_key FROM steps WHERE run_id=? AND status='started'", (run_id,)
+            "SELECT idx, name, idempotency_key, attempt FROM steps WHERE run_id=? AND status='started'",
+            (run_id,),
         ).fetchone()
         if pending is not None:
             idx, name, key = pending["idx"], pending["name"], pending["idempotency_key"]
+            attempt = pending["attempt"]
         else:
             name = planner.decide(state)
             if name is None:
@@ -106,26 +137,43 @@ def advance(conn, run_id: str, hook: Hook | None = None) -> str:
             if _needs_approval(conn, run_id, idx, name, state):
                 return "awaiting_approval"
             key = f"{run_id}:{idx}"
+            attempt = 1
             with tx(conn):
                 conn.execute(
-                    "INSERT INTO steps(run_id, idx, name, status, input_json, idempotency_key, started_at) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    (run_id, idx, name, "started", _dumps(state), key, now()),
+                    "INSERT INTO steps(run_id, idx, name, status, input_json, attempt, idempotency_key, "
+                    "started_at) VALUES (?,?,?,?,?,?,?,?)",
+                    (run_id, idx, name, "started", _dumps(state), attempt, key, now()),
                 )
                 _event(conn, run_id, "step_started", {"idx": idx, "name": name})
 
         try:
-            output = tools.TOOLS[name](conn, key, state)
+            output = tools.call(conn, name, key, state, attempt)
+        except tools.RetryableToolError as exc:
+            if attempt < RETRY_POLICY.max_attempts:
+                delay = RETRY_POLICY.delay(attempt)
+                with tx(conn):
+                    # Conditional on attempt so a stale caller cannot double-bump.
+                    bumped = conn.execute(
+                        "UPDATE steps SET attempt=attempt+1, error=? "
+                        "WHERE run_id=? AND idx=? AND status='started' AND attempt=?",
+                        (str(exc), run_id, idx, attempt),
+                    ).rowcount
+                    if bumped:
+                        _event(conn, run_id, "step_attempt_failed", {
+                            "idx": idx, "name": name, "attempt": attempt, "error": str(exc),
+                            "retryable": True, "next_delay_s": delay,
+                        })
+                if hook:
+                    hook("retry_scheduled", name)
+                _sleep(delay)  # Outside tx(): never hold the write lock while waiting.
+                continue
+            info = {"attempt": attempt, "retryable": True, "exhausted": True}
+            if name in tools.SIDE_EFFECTING:
+                # The effect may have committed before the failure; the key finds it.
+                info |= {"idempotency_key": key, "outcome_unknown": True}
+            return _fail(conn, run_id, idx, name, f"retries exhausted after {attempt} attempts: {exc}", info)
         except tools.ToolError as exc:
-            with tx(conn):
-                conn.execute(
-                    "UPDATE steps SET status='failed', error=?, finished_at=? WHERE run_id=? AND idx=?",
-                    (str(exc), now(), run_id, idx),
-                )
-                _set_status(conn, run_id, "failed", str(exc))
-                _event(conn, run_id, "step_failed", {"idx": idx, "name": name, "error": str(exc)})
-                _event(conn, run_id, "run_failed", {"error": str(exc)})
-            return "failed"
+            return _fail(conn, run_id, idx, name, str(exc), {"attempt": attempt, "retryable": False})
 
         if hook:
             hook("after_tool", name)
@@ -143,7 +191,22 @@ def advance(conn, run_id: str, hook: Hook | None = None) -> str:
                     "INSERT INTO checkpoints(run_id, after_step_idx, state_json, ts) VALUES (?,?,?,?)",
                     (run_id, idx, _dumps(state), now()),
                 )
-                _event(conn, run_id, "step_succeeded", {"idx": idx, "name": name, "output": output})
+                _event(conn, run_id, "step_succeeded", {
+                    "idx": idx, "name": name, "attempt": attempt, "output": output,
+                })
+
+
+def _fail(conn, run_id: str, idx: int, name: str, error: str, info: dict) -> str:
+    """Terminal step failure: fails the step and the run; no later step runs."""
+    with tx(conn):
+        conn.execute(
+            "UPDATE steps SET status='failed', error=?, finished_at=? WHERE run_id=? AND idx=?",
+            (error, now(), run_id, idx),
+        )
+        _set_status(conn, run_id, "failed", error)
+        _event(conn, run_id, "step_failed", {"idx": idx, "name": name, "error": error, **info})
+        _event(conn, run_id, "run_failed", {"error": error, **info})
+    return "failed"
 
 
 def _needs_approval(conn, run_id: str, idx: int, name: str, state: dict) -> bool:
@@ -223,7 +286,7 @@ def get_run_detail(conn, run_id: str) -> RunDetail:
         StepOut(
             idx=r["idx"], name=r["name"], status=r["status"], input=json.loads(r["input_json"]),
             output=json.loads(r["output_json"]) if r["output_json"] else None, error=r["error"],
-            idempotency_key=r["idempotency_key"], started_at=r["started_at"], finished_at=r["finished_at"],
+            attempt=r["attempt"], idempotency_key=r["idempotency_key"], started_at=r["started_at"], finished_at=r["finished_at"],
         )
         for r in conn.execute("SELECT * FROM steps WHERE run_id=? ORDER BY idx", (run_id,))
     ]

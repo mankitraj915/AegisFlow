@@ -40,6 +40,16 @@ def test_scenario_threshold_over_api(client):
     assert create(client, "ORD-3003")["status"] == "awaiting_approval"
 
 
+def test_fault_injection_over_api(client):
+    run = create(client, "ORD-1001", faults={"issue_refund": ["retryable_after_commit"]})
+    assert run["status"] == "succeeded" and run["scenario"]["faults"] == {"issue_refund": ["retryable_after_commit"]}
+    detail = client.get(f"/runs/{run['id']}").json()
+    assert [s["attempt"] for s in detail["steps"]] == [1, 1, 1, 1, 2, 1]
+    for bad in ({"nope": ["retryable"]}, {"fetch_order": ["flaky"]}):
+        r = client.post("/runs", json={"order_id": "ORD-1001", "scenario": {"faults": bad}})
+        assert r.status_code == 422
+
+
 def test_error_contract(client):
     assert client.get("/runs/nope").status_code == 404
     assert client.get("/runs/nope/events").status_code == 404

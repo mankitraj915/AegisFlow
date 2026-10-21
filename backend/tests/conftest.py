@@ -1,8 +1,17 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from aegisflow import engine
 from aegisflow.api import create_app
 from aegisflow.db import connect
+
+
+@pytest.fixture(autouse=True)
+def sleeps(monkeypatch):
+    """Record retry backoff delays instead of sleeping."""
+    calls = []
+    monkeypatch.setattr(engine, "_sleep", calls.append)
+    return calls
 
 
 @pytest.fixture

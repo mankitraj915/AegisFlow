@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS steps (
     input_json      TEXT NOT NULL,
     output_json     TEXT,
     error           TEXT,
+    attempt         INTEGER NOT NULL DEFAULT 1,
     idempotency_key TEXT NOT NULL UNIQUE,
     started_at      TEXT NOT NULL,
     finished_at     TEXT,
@@ -75,7 +76,16 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Upgrade databases created before steps.attempt existed. Idempotent."""
+    with tx(conn):
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(steps)")}
+        if "attempt" not in cols:
+            conn.execute("ALTER TABLE steps ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
 
 
 @contextmanager

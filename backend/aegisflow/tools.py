@@ -1,9 +1,12 @@
 """Deterministic mock tools. Money is integer paise everywhere.
 
 Each tool is fn(conn, idempotency_key, state) -> output dict. Fatal failures
-raise ToolError. issue_refund is the only side-effecting tool; it writes to
-the mock payment ledger in its own committed transaction, like an external
-system would.
+raise ToolError; transient ones raise RetryableToolError. issue_refund is the
+only side-effecting tool; it writes to the mock payment ledger in its own
+committed transaction, like an external system would.
+
+The engine invokes tools through call(), which applies the scenario's
+deterministic fault plan for the given attempt.
 """
 import sqlite3
 from collections.abc import Callable
@@ -13,6 +16,15 @@ from .db import now, tx
 
 class ToolError(Exception):
     """Fatal, non-retryable tool failure."""
+
+
+class RetryableToolError(Exception):
+    """Transient tool failure; the same step may be retried with the same key.
+    Deliberately not a ToolError, so fatal handlers never swallow it."""
+
+
+# Tools whose effects may have committed even when they raise.
+SIDE_EFFECTING = {"issue_refund"}
 
 
 ORDERS = {
@@ -108,3 +120,19 @@ TOOLS: dict[str, Callable] = {
     "issue_refund": issue_refund,
     "notify_customer": notify_customer,
 }
+
+
+def call(conn, name: str, key: str, state, attempt: int) -> dict:
+    """Run tool `name`, applying the injected fault (if any) for this attempt.
+    'retryable_after_commit' runs the tool first, so its effects commit, then
+    fails: a timeout after the external system already processed the call."""
+    plan = state["scenario"].get("faults", {}).get(name, [])
+    fault = plan[attempt - 1] if attempt <= len(plan) else None
+    if fault == "fatal":
+        raise ToolError(f"injected fatal fault: {name} attempt {attempt}")
+    if fault == "retryable":
+        raise RetryableToolError(f"injected transient fault: {name} attempt {attempt}")
+    output = TOOLS[name](conn, key, state)
+    if fault == "retryable_after_commit":
+        raise RetryableToolError(f"injected timeout after commit: {name} attempt {attempt}")
+    return output

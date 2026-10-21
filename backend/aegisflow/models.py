@@ -1,11 +1,28 @@
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+from . import planner
 
 DEFAULT_APPROVAL_THRESHOLD_PAISE = 500_000  # ₹5,000
+
+FaultKind = Literal["retryable", "fatal", "retryable_after_commit"]
 
 
 class Scenario(BaseModel):
     approval_threshold_paise: int = Field(DEFAULT_APPROVAL_THRESHOLD_PAISE, ge=0)
     require_manual_review: bool = False
+    # Deterministic fault injection: step name -> outcome of attempts 1..n.
+    # Attempts beyond the list run normally.
+    faults: dict[str, list[FaultKind]] = Field(default_factory=dict)
+
+    @field_validator("faults")
+    @classmethod
+    def _known_steps(cls, faults):
+        unknown = sorted(set(faults) - set(planner.PIPELINE))
+        if unknown:
+            raise ValueError(f"unknown steps: {unknown}")
+        return faults
 
 
 class CreateRun(BaseModel):
@@ -35,6 +52,7 @@ class StepOut(BaseModel):
     input: dict
     output: dict | None
     error: str | None
+    attempt: int
     idempotency_key: str
     started_at: str
     finished_at: str | None
