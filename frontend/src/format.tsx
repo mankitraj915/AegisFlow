@@ -15,9 +15,10 @@ export function formatTime(iso: string): string {
 
 export const shortId = (id: string) => id.slice(0, 8);
 
-// Run and step statuses, plus "outcome_unknown": not a backend status, but a
-// failed run whose side-effecting step ran out of retries after its effect
-// may have committed.
+// Run and step statuses, plus two derived from events rather than the backend
+// status: "outcome_unknown", a failed run whose side-effecting step ran out of
+// retries after its effect may have committed, and "interrupted", a running
+// run stopped by a simulated interruption that has not been resumed.
 const LABELS: Record<string, string> = {
   running: "Running",
   succeeded: "Succeeded",
@@ -25,6 +26,7 @@ const LABELS: Record<string, string> = {
   awaiting_approval: "Awaiting approval",
   rejected: "Rejected",
   outcome_unknown: "Outcome unknown",
+  interrupted: "Interrupted",
   started: "In progress",
 };
 

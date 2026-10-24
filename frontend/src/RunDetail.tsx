@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { api, messageOf, type Approval, type RunDetail as Detail, type RunEvent } from "./api";
+import { api, messageOf, type Approval, type RunDetail as Detail, type RunEvent, type Step } from "./api";
 import { formatPaise, formatTime, outcomeUnknownEvent, StatusBadge } from "./format";
 
 type Loaded = { run: Detail; events: RunEvent[] };
@@ -44,7 +44,7 @@ export function RunDetail({ runId, onChanged }: { runId: string; onChanged: () =
       <header className="panel detail-head">
         <div className="detail-title-row">
           <h2 id="detail-title"><span className="mono">{run.order_id}</span></h2>
-          <StatusBadge status={unknown ? "outcome_unknown" : run.status} />
+          <StatusBadge status={unknown ? "outcome_unknown" : run.interrupted ? "interrupted" : run.status} />
           <button type="button" className="push-right" onClick={reload}>Reload</button>
         </div>
         <dl className="facts">
@@ -68,12 +68,16 @@ export function RunDetail({ runId, onChanged }: { runId: string; onChanged: () =
         {!unknown && run.status === "failed" && run.error && (
           <p className="alert alert-error" role="status"><strong>Failed:</strong> {run.error}</p>
         )}
-        {run.status === "running" && (
-          <p className="alert alert-warn" role="status">
-            This run stopped before reaching a terminal state. The API has no resume endpoint.
-          </p>
-        )}
       </header>
+
+      {run.status === "running" && (
+        <ResumePanel
+          runId={run.id}
+          interrupted={run.interrupted}
+          step={run.steps.find((s) => s.status === "started")}
+          onResumed={() => { reload(); onChanged(); }}
+        />
+      )}
 
       {run.status === "awaiting_approval" && run.pending_approval && (
         <ApprovalPanel runId={run.id} approval={run.pending_approval} onDecided={() => { reload(); onChanged(); }} />
@@ -106,6 +110,32 @@ export function RunDetail({ runId, onChanged }: { runId: string; onChanged: () =
         )}
       </section>
 
+      <section className="panel" aria-labelledby="ledger-title">
+        <h3 id="ledger-title">Refund ledger</h3>
+        <p className="hint">Rows in the simulated payment system written under this run's idempotency keys.</p>
+        {run.refunds.length === 0 ? (
+          <p className="muted">No refund recorded.</p>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Idempotency key</th><th>Order</th><th>Amount</th><th>Recorded</th></tr>
+              </thead>
+              <tbody>
+                {run.refunds.map((r) => (
+                  <tr key={r.idempotency_key}>
+                    <td className="mono small">{r.idempotency_key}</td>
+                    <td className="mono">{r.order_id}</td>
+                    <td>{formatPaise(r.amount_paise)}</td>
+                    <td className="small">{formatTime(r.created_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
       <section className="panel" aria-labelledby="events-title">
         <h3 id="events-title">Event history</h3>
         <ol className="events">
@@ -127,6 +157,54 @@ export function RunDetail({ runId, onChanged }: { runId: string; onChanged: () =
           ))}
         </ol>
       </section>
+    </section>
+  );
+}
+
+function ResumePanel({ runId, interrupted, step, onResumed }: {
+  runId: string;
+  interrupted: boolean;
+  step: Step | undefined;
+  onResumed: () => void;
+}) {
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function resume() {
+    setError(null);
+    setPending(true);
+    try {
+      await api.resume(runId);
+      onResumed();
+    } catch (err) {
+      // A 409 means the run is already being advanced or is no longer running; Reload shows which.
+      setError(messageOf(err));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <section className="panel approval" aria-labelledby="resume-title">
+      <h3 id="resume-title">{interrupted ? "Interrupted (simulated)" : "Run not finished"}</h3>
+      <p>
+        {interrupted
+          ? "An injected fault stopped this run at a known point: after the step's tool call committed, before the step was recorded as succeeded. The server process did not restart."
+          : "This run stopped before reaching a terminal state, or is still being advanced by another request."}
+      </p>
+      {step && (
+        <p>
+          Step <span className="mono">#{step.idx} {step.name}</span> is in progress with idempotency key{" "}
+          <code>{step.idempotency_key}</code>. Resuming re-runs it with the same key, so a refund already in
+          the ledger is replayed rather than written twice.
+        </p>
+      )}
+      {error && <p className="alert alert-error" role="alert">{error}</p>}
+      <div className="actions">
+        <button type="button" className="primary" disabled={pending} onClick={resume}>
+          {pending ? "Resuming…" : "Resume run"}
+        </button>
+      </div>
     </section>
   );
 }
@@ -200,7 +278,7 @@ function ApprovalPanel({ runId, approval, onDecided }: { runId: string; approval
 
 function tone(e: RunEvent): string {
   if (e.type === "run_failed" || e.type === "step_failed" || e.type === "run_rejected") return "bad";
-  if (e.type === "step_attempt_failed" || e.type === "approval_requested") return "warn";
+  if (e.type === "step_attempt_failed" || e.type === "approval_requested" || e.type === "run_interrupted") return "warn";
   if (e.type === "run_succeeded") return "good";
   return "plain";
 }
@@ -216,6 +294,8 @@ function summarize(e: RunEvent): string {
     case "step_attempt_failed": return `${step}${attempt} failed, retrying in ${p.next_delay_s}s: ${p.error}`;
     case "step_failed": return `${step}${attempt}: ${p.error}`;
     case "run_failed": return String(p.error);
+    case "run_interrupted": return `Simulated interruption after ${step}${attempt}, key ${p.idempotency_key}`;
+    case "run_resumed": return p.name === undefined ? "Resumed" : `Resuming ${step} with key ${p.idempotency_key}`;
     case "approval_requested": return `${p.step}: ${p.reason}`;
     case "approval_approved": return `Approved by ${p.decided_by}`;
     case "approval_rejected": return `Rejected by ${p.decided_by}${p.reason ? `: ${p.reason}` : ""}`;

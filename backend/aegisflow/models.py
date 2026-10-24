@@ -6,7 +6,7 @@ from . import planner
 
 DEFAULT_APPROVAL_THRESHOLD_PAISE = 500_000  # ₹5,000
 
-FaultKind = Literal["retryable", "fatal", "retryable_after_commit"]
+FaultKind = Literal["retryable", "fatal", "retryable_after_commit", "interrupt_after_commit"]
 
 
 class Scenario(BaseModel):
@@ -39,6 +39,9 @@ class RunOut(BaseModel):
     id: str
     order_id: str
     status: str
+    # Derived from events: running, and stopped by a simulated interruption that
+    # has not been resumed. Not a separate status; status stays 'running'.
+    interrupted: bool
     scenario: Scenario
     error: str | None
     created_at: str
@@ -67,10 +70,18 @@ class ApprovalOut(BaseModel):
     decided_at: str | None
 
 
+class RefundOut(BaseModel):
+    idempotency_key: str
+    order_id: str
+    amount_paise: int
+    created_at: str
+
+
 class RunDetail(RunOut):
     steps: list[StepOut]
     pending_approval: ApprovalOut | None
     latest_checkpoint_idx: int | None
+    refunds: list[RefundOut]  # Mock ledger rows written under this run's step keys.
 
 
 class EventOut(BaseModel):

@@ -125,7 +125,9 @@ TOOLS: dict[str, Callable] = {
 def call(conn, name: str, key: str, state, attempt: int) -> dict:
     """Run tool `name`, applying the injected fault (if any) for this attempt.
     'retryable_after_commit' runs the tool first, so its effects commit, then
-    fails: a timeout after the external system already processed the call."""
+    fails: a timeout after the external system already processed the call.
+    'interrupt_after_commit' runs the tool normally here; the engine then stops
+    the run before recording the step (see engine._interrupt_planned)."""
     plan = state["scenario"].get("faults", {}).get(name, [])
     fault = plan[attempt - 1] if attempt <= len(plan) else None
     if fault == "fatal":

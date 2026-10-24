@@ -10,11 +10,17 @@ attempt reuses the step's idempotency key. A crash mid-attempt re-executes the
 same attempt number; a crash during backoff resumes at the next one. Crashes
 therefore do not consume retry budget; only recorded tool failures do.
 
-Concurrency: advance() for one run is only reached by start_run (on a run id
-no one else has yet) and by the single winner of the conditional approval
-transition, so no application path runs two advance() calls on the same run.
-Direct concurrent callers are not guarded against duplicate tool execution;
-side effects stay exactly-once only through the ledger's idempotency key.
+Interruption: an 'interrupt_after_commit' fault stops the run after the tool
+call (for issue_refund, after the ledger commit) and before the step is
+recorded, exactly like a crash at the after_tool hook, except that advance()
+returns normally and records run_interrupted. The run stays 'running' until
+resume() continues it with the same step and key.
+
+Concurrency: every advance() first takes the run's lease (runs.lease_token) in
+a write transaction, so at most one advance() drives a run at a time; another
+caller gets Conflict. The lease is released when advance() returns or raises.
+One left behind by a killed process expires after LEASE_S, which is far longer
+than any advance() takes under RETRY_POLICY.
 """
 import json
 import sqlite3
@@ -22,11 +28,12 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from . import planner, tools
 from .db import now, tx
 from .models import (
-    ApprovalOut, EventOut, RunDetail, RunOut, Scenario, StepOut,
+    ApprovalOut, EventOut, RefundOut, RunDetail, RunOut, Scenario, StepOut,
 )
 
 # Test seam: called as hook(point, step_name) at named crash windows.
@@ -46,6 +53,7 @@ class RetryPolicy:
 
 RETRY_POLICY = RetryPolicy()
 _sleep = time.sleep  # Test seam: replaced so tests never really wait.
+LEASE_S = 60
 
 
 class RunNotFound(Exception):
@@ -97,6 +105,32 @@ def _load_state(conn, run) -> dict:
     return {"order_id": run["order_id"], "scenario": json.loads(run["scenario_json"]), "outputs": outputs}
 
 
+def _claim(conn, run_id: str) -> str:
+    """Take the run's lease or raise Conflict. Must be called inside tx()."""
+    token = uuid.uuid4().hex
+    expires = (datetime.now(UTC) + timedelta(seconds=LEASE_S)).isoformat()
+    claimed = conn.execute(
+        "UPDATE runs SET lease_token=?, lease_expires_at=? "
+        "WHERE id=? AND (lease_token IS NULL OR lease_expires_at < ?)",
+        (token, expires, run_id, now()),
+    ).rowcount
+    if not claimed:
+        raise Conflict(f"run {run_id} is already being advanced")
+    return token
+
+
+def _drive(conn, run_id: str, token: str, hook: Hook | None) -> str:
+    """Advance under a lease the caller took, releasing it however advancing ends."""
+    try:
+        return _advance(conn, run_id, hook)
+    finally:
+        with tx(conn):
+            conn.execute(
+                "UPDATE runs SET lease_token=NULL, lease_expires_at=NULL WHERE id=? AND lease_token=?",
+                (run_id, token),
+            )
+
+
 def start_run(conn, order_id: str, scenario: Scenario, hook: Hook | None = None) -> str:
     if not tools.order_exists(order_id):
         raise OrderNotFound(order_id)
@@ -112,7 +146,29 @@ def start_run(conn, order_id: str, scenario: Scenario, hook: Hook | None = None)
 
 
 def advance(conn, run_id: str, hook: Hook | None = None) -> str:
-    """Drive the run until it finishes, fails, or needs approval. Returns status."""
+    """Drive the run until it finishes, fails, needs approval or is interrupted.
+    Returns status. Raises Conflict if another advance() holds the run."""
+    with tx(conn):
+        _get_run(conn, run_id)
+        token = _claim(conn, run_id)
+    return _drive(conn, run_id, token, hook)
+
+
+def resume(conn, run_id: str, hook: Hook | None = None) -> str:
+    """Explicitly continue a run left 'running' by an interruption or crash."""
+    with tx(conn):
+        run = _get_run(conn, run_id)
+        if run["status"] != "running":
+            raise Conflict(f"run {run_id} is {run['status']}; only a running run can be resumed")
+        token = _claim(conn, run_id)
+        pending = conn.execute(
+            "SELECT idx, name, idempotency_key FROM steps WHERE run_id=? AND status='started'", (run_id,)
+        ).fetchone()
+        _event(conn, run_id, "run_resumed", dict(pending) if pending else {})
+    return _drive(conn, run_id, token, hook)
+
+
+def _advance(conn, run_id: str, hook: Hook | None) -> str:
     while True:
         run = _get_run(conn, run_id)
         if run["status"] != "running":
@@ -177,6 +233,12 @@ def advance(conn, run_id: str, hook: Hook | None = None) -> str:
 
         if hook:
             hook("after_tool", name)
+        if _interrupt_planned(conn, run_id, idx, name, attempt, state):
+            with tx(conn):
+                _event(conn, run_id, "run_interrupted", {
+                    "idx": idx, "name": name, "attempt": attempt, "idempotency_key": key, "simulated": True,
+                })
+            return "running"
 
         with tx(conn):
             # Conditional: a concurrent advance may already have completed this step.
@@ -209,6 +271,18 @@ def _fail(conn, run_id: str, idx: int, name: str, error: str, info: dict) -> str
     return "failed"
 
 
+def _interrupt_planned(conn, run_id: str, idx: int, name: str, attempt: int, state: dict) -> bool:
+    """True if the fault plan interrupts this attempt and has not done so yet.
+    Resuming re-executes the same attempt, so the interruption fires only once."""
+    plan = state["scenario"].get("faults", {}).get(name, [])
+    if attempt > len(plan) or plan[attempt - 1] != "interrupt_after_commit":
+        return False
+    return conn.execute(
+        "SELECT 1 FROM events WHERE run_id=? AND type='run_interrupted' AND json_extract(payload_json, '$.idx')=?",
+        (run_id, idx),
+    ).fetchone() is None
+
+
 def _needs_approval(conn, run_id: str, idx: int, name: str, state: dict) -> bool:
     """True if the run must pause before step idx. Creates the pending approval."""
     reason = planner.approval_reason(name, state)
@@ -233,7 +307,9 @@ def _needs_approval(conn, run_id: str, idx: int, name: str, state: dict) -> bool
     return True
 
 
-def _decide(conn, run_id: str, decision: str, decided_by: str, reason: str | None) -> None:
+def _decide(conn, run_id: str, decision: str, decided_by: str, reason: str | None) -> str | None:
+    """Record the decision. On approval, also takes the run's lease, in the same
+    transaction, and returns its token for the caller to advance under."""
     _get_run(conn, run_id)
     new_run_status = "running" if decision == "approved" else "rejected"
     with tx(conn):
@@ -250,11 +326,13 @@ def _decide(conn, run_id: str, decision: str, decided_by: str, reason: str | Non
         _event(conn, run_id, f"approval_{decision}", {"decided_by": decided_by, "reason": reason})
         if decision == "rejected":
             _event(conn, run_id, "run_rejected", {})
+            return None
+        return _claim(conn, run_id)
 
 
 def approve(conn, run_id: str, decided_by: str, hook: Hook | None = None) -> str:
-    _decide(conn, run_id, "approved", decided_by, None)
-    return advance(conn, run_id, hook)
+    token = _decide(conn, run_id, "approved", decided_by, None)
+    return _drive(conn, run_id, token, hook)
 
 
 def reject(conn, run_id: str, decided_by: str, reason: str | None = None) -> str:
@@ -264,16 +342,37 @@ def reject(conn, run_id: str, decided_by: str, reason: str | None = None) -> str
 
 # ---- reads ----
 
+# Runs plus a derived 'interrupted' flag: still running, and the latest
+# interrupt/resume event is an interruption, so nothing has resumed it since.
+_RUNS_READ = """
+SELECT runs.*, (
+    status = 'running' AND (
+        SELECT type FROM events
+        WHERE run_id = runs.id AND type IN ('run_interrupted', 'run_resumed')
+        ORDER BY seq DESC LIMIT 1
+    ) = 'run_interrupted'
+) AS interrupted
+FROM runs
+"""
+
+
+def _read_run(conn, run_id: str) -> sqlite3.Row:
+    row = conn.execute(_RUNS_READ + "WHERE id=?", (run_id,)).fetchone()
+    if row is None:
+        raise RunNotFound(run_id)
+    return row
+
+
 def _run_out(row) -> RunOut:
     return RunOut(
-        id=row["id"], order_id=row["order_id"], status=row["status"],
+        id=row["id"], order_id=row["order_id"], status=row["status"], interrupted=bool(row["interrupted"]),
         scenario=Scenario(**json.loads(row["scenario_json"])), error=row["error"],
         created_at=row["created_at"], updated_at=row["updated_at"],
     )
 
 
 def get_run(conn, run_id: str) -> RunOut:
-    return _run_out(_get_run(conn, run_id))
+    return _run_out(_read_run(conn, run_id))
 
 
 def count_runs(conn) -> int:
@@ -281,11 +380,11 @@ def count_runs(conn) -> int:
 
 
 def list_runs(conn) -> list[RunOut]:
-    return [_run_out(r) for r in conn.execute("SELECT * FROM runs ORDER BY created_at, rowid")]
+    return [_run_out(r) for r in conn.execute(_RUNS_READ + "ORDER BY created_at, rowid")]
 
 
 def get_run_detail(conn, run_id: str) -> RunDetail:
-    run = _get_run(conn, run_id)
+    run = _read_run(conn, run_id)
     steps = [
         StepOut(
             idx=r["idx"], name=r["name"], status=r["status"], input=json.loads(r["input_json"]),
@@ -300,6 +399,14 @@ def get_run_detail(conn, run_id: str) -> RunDetail:
     cp = conn.execute(
         "SELECT MAX(after_step_idx) FROM checkpoints WHERE run_id=?", (run_id,)
     ).fetchone()[0]
+    refunds = [
+        RefundOut(**dict(r))
+        for r in conn.execute(
+            "SELECT r.idempotency_key, r.order_id, r.amount_paise, r.created_at FROM refunds r "
+            "JOIN steps s ON s.idempotency_key = r.idempotency_key WHERE s.run_id=? ORDER BY s.idx",
+            (run_id,),
+        )
+    ]
     return RunDetail(
         **_run_out(run).model_dump(),
         steps=steps,
@@ -309,6 +416,7 @@ def get_run_detail(conn, run_id: str) -> RunDetail:
             decided_by=appr["decided_by"], reason=appr["reason"], decided_at=appr["decided_at"],
         ) if appr else None,
         latest_checkpoint_idx=cp,
+        refunds=refunds,
     )
 
 

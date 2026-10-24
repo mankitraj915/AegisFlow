@@ -66,6 +66,11 @@ def create_app(db_path: str | None = None, max_runs: int | None = None) -> FastA
         guarded(engine.approve, conn, run_id, body.decided_by)
         return engine.get_run(conn, run_id)
 
+    @app.post("/runs/{run_id}/resume", response_model=RunOut)
+    def resume(run_id: str, conn=Depends(get_conn)):
+        guarded(engine.resume, conn, run_id)
+        return engine.get_run(conn, run_id)
+
     @app.post("/runs/{run_id}/reject", response_model=RunOut)
     def reject(run_id: str, body: Decision, conn=Depends(get_conn)):
         guarded(engine.reject, conn, run_id, body.decided_by, body.reason)

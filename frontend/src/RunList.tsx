@@ -35,7 +35,7 @@ export function RunList({ runs, error, selectedId, onSelect, onReload }: Props) 
               >
                 <span className="run-item-main">
                   <span className="mono">{run.order_id}</span>
-                  <StatusBadge status={run.status} />
+                  <StatusBadge status={run.interrupted ? "interrupted" : run.status} />
                 </span>
                 <span className="run-item-meta">
                   <span className="mono">{shortId(run.id)}</span> · {formatTime(run.created_at)}

@@ -81,6 +81,11 @@ export default function App() {
                 <span className="mono">ORD-1001</span> with <em>Times out after commit, every attempt</em>: retries run
                 out and the run ends as <strong>Outcome unknown</strong>.
               </li>
+              <li>
+                <span className="mono">ORD-1001</span> with <em>Simulated interruption after commit</em> on{" "}
+                <span className="mono">issue_refund</span>: the refund commits, then the run stops before the step is
+                recorded. Resume it to see the same idempotency key reused and a single ledger entry.
+              </li>
               <li><span className="mono">ORD-9009</span>: a cancelled order fails the refund policy check.</li>
             </ul>
             <p className="muted">Select a run to see its steps, events and approval state.</p>

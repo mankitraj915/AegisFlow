@@ -56,6 +56,29 @@ def test_fault_injection_over_api(client):
         assert r.status_code == 422
 
 
+def test_interrupt_and_resume_over_api(client):
+    run = create(client, "ORD-1001", faults={"issue_refund": ["interrupt_after_commit"]})
+    assert (run["status"], run["interrupted"]) == ("running", True)
+    assert [(r["status"], r["interrupted"]) for r in client.get("/runs").json()] == [("running", True)]
+    detail = client.get(f"/runs/{run['id']}").json()
+    stuck = detail["steps"][-1]
+    assert (stuck["name"], stuck["status"]) == ("issue_refund", "started")
+    key = stuck["idempotency_key"]
+    assert [r["idempotency_key"] for r in detail["refunds"]] == [key]
+    assert client.get(f"/runs/{run['id']}/events").json()[-1]["type"] == "run_interrupted"
+
+    r = client.post(f"/runs/{run['id']}/resume")
+    assert r.status_code == 200 and (r.json()["status"], r.json()["interrupted"]) == ("succeeded", False)
+    detail = client.get(f"/runs/{run['id']}").json()
+    assert detail["steps"][4]["idempotency_key"] == key and detail["steps"][4]["status"] == "succeeded"
+    assert [s["name"] for s in detail["steps"]][-1] == "notify_customer"
+    assert [(r["idempotency_key"], r["amount_paise"]) for r in detail["refunds"]] == [(key, 129_900)]
+    types = [e["type"] for e in client.get(f"/runs/{run['id']}/events").json()]
+    assert types.count("run_interrupted") == types.count("run_resumed") == 1 and types[-1] == "run_succeeded"
+    assert client.post(f"/runs/{run['id']}/resume").status_code == 409
+    assert client.post("/runs/nope/resume").status_code == 404
+
+
 def test_error_contract(client):
     assert client.get("/runs/nope").status_code == 404
     assert client.get("/runs/nope/events").status_code == 404

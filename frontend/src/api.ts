@@ -2,7 +2,7 @@
 // Requests go to /api, which the Vite dev/preview server proxies to the backend.
 
 export type RunStatus = "running" | "succeeded" | "failed" | "awaiting_approval" | "rejected";
-export type FaultKind = "retryable" | "fatal" | "retryable_after_commit";
+export type FaultKind = "retryable" | "fatal" | "retryable_after_commit" | "interrupt_after_commit";
 
 // Mirrors planner.PIPELINE; the backend rejects fault plans for other step names.
 export const PIPELINE = [
@@ -24,6 +24,7 @@ export interface Run {
   id: string;
   order_id: string;
   status: RunStatus;
+  interrupted: boolean; // Running, stopped by a simulated interruption, not yet resumed.
   scenario: Scenario;
   error: string | null;
   created_at: string;
@@ -52,10 +53,19 @@ export interface Approval {
   decided_at: string | null;
 }
 
+// A row in the mock payment ledger, written under one of the run's step keys.
+export interface Refund {
+  idempotency_key: string;
+  order_id: string;
+  amount_paise: number;
+  created_at: string;
+}
+
 export interface RunDetail extends Run {
   steps: Step[];
   pending_approval: Approval | null;
   latest_checkpoint_idx: number | null;
+  refunds: Refund[];
 }
 
 export interface RunEvent {
@@ -111,6 +121,7 @@ export const api = {
   createRun: (order_id: string, scenario: Scenario) => request<Run>("/runs", post({ order_id, scenario })),
   approve: (id: string, decided_by: string) =>
     request<Run>(`/runs/${encodeURIComponent(id)}/approve`, post({ decided_by })),
+  resume: (id: string) => request<Run>(`/runs/${encodeURIComponent(id)}/resume`, { method: "POST" }),
   reject: (id: string, decided_by: string, reason: string | null) =>
     request<Run>(`/runs/${encodeURIComponent(id)}/reject`, post({ decided_by, reason })),
 };

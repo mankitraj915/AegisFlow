@@ -22,6 +22,7 @@ const FAULT_PRESETS: Record<string, { label: string; plan: FaultKind[] }> = {
     label: "Times out after commit, every attempt",
     plan: ["retryable_after_commit", "retryable_after_commit", "retryable_after_commit"],
   },
+  interrupt: { label: "Simulated interruption after commit (resume manually)", plan: ["interrupt_after_commit"] },
 };
 
 type Errors = { order?: string; threshold?: string; submit?: string };

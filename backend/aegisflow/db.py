@@ -10,7 +10,10 @@ CREATE TABLE IF NOT EXISTS runs (
     status        TEXT NOT NULL,
     error         TEXT,
     created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
+    updated_at    TEXT NOT NULL,
+    -- Held while one advance() drives the run; see engine._claim.
+    lease_token      TEXT,
+    lease_expires_at TEXT
 );
 CREATE TABLE IF NOT EXISTS steps (
     id              INTEGER PRIMARY KEY,
@@ -81,11 +84,15 @@ def connect(path: str) -> sqlite3.Connection:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Upgrade databases created before steps.attempt existed. Idempotent."""
+    """Upgrade databases created before steps.attempt or the runs lease existed. Idempotent."""
     with tx(conn):
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(steps)")}
         if "attempt" not in cols:
             conn.execute("ALTER TABLE steps ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1")
+        run_cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)")}
+        for col in ("lease_token", "lease_expires_at"):
+            if col not in run_cols:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
 
 
 @contextmanager

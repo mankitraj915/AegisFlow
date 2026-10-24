@@ -154,6 +154,7 @@ form button[type="submit"] { margin-top: 14px; }
 .badge-awaiting_approval { background: var(--warn-bg); color: var(--warn-fg); }
 .badge-running, .badge-started { background: var(--info-bg); color: var(--info-fg); }
 .badge-outcome_unknown { background: var(--unknown-bg); color: var(--unknown-fg); }
+.badge-interrupted { background: var(--warn-bg); color: var(--warn-fg); }
 
 .alert { margin: 12px 0 0; padding: 10px 12px; border-radius: 4px; border-left: 3px solid; }
 .alert-error { background: var(--bad-bg); color: var(--bad-fg); }

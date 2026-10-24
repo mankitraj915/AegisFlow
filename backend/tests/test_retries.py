@@ -188,8 +188,10 @@ def test_unknown_fault_step_is_rejected():
 
 
 def test_milestone1_database_is_migrated_and_resumable(db_path):
-    old_schema = db.SCHEMA.replace("    attempt         INTEGER NOT NULL DEFAULT 1,\n", "")
-    assert old_schema != db.SCHEMA
+    old_schema = db.SCHEMA.replace("    attempt         INTEGER NOT NULL DEFAULT 1,\n", "").replace(
+        "    updated_at    TEXT NOT NULL,\n    -- Held while one advance() drives the run; see engine._claim.\n"
+        "    lease_token      TEXT,\n    lease_expires_at TEXT\n", "    updated_at    TEXT NOT NULL\n")
+    assert "attempt" not in old_schema and "lease" not in old_schema
     raw = sqlite3.connect(db_path)
     raw.executescript(old_schema)
     run_id = "legacy"

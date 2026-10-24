@@ -97,10 +97,11 @@ What the free tier means for this demo (see [Render's free tier documentation](h
 | GET | `/health` | Liveness and database check |
 | POST | `/runs/{id}/approve` | `{decided_by}` |
 | POST | `/runs/{id}/reject` | `{decided_by, reason?}` |
+| POST | `/runs/{id}/resume` | Continue a run left `running` by an interruption (409 if it isn't `running` or is already being advanced) |
 
 These paths are relative to the API root: `http://127.0.0.1:8000` with `create_app`, or `/api` with `create_site` and the dev proxy.
 
-Runs execute synchronously. `POST /runs` and `/approve` return only when the run has succeeded, failed, or paused for approval.
+Runs execute synchronously. `POST /runs`, `/approve` and `/resume` return only when the run has succeeded, failed, paused for approval, or been interrupted (status `running`). `GET /runs/{id}` includes `refunds`, the ledger rows written under the run's idempotency keys.
 
 Input limits:
 - `order_id`: at most 64 characters
@@ -138,10 +139,21 @@ Only the first decision counts; any later one gets HTTP 409.
   - `retryable` fails that attempt with a transient error.
   - `fatal` fails the run without retrying.
   - `retryable_after_commit` runs the step, so the refund is written to the ledger, and then fails with a transient error.
+  - `interrupt_after_commit` runs the step and then stops the run before the step is recorded as succeeded (see below).
 
   The UI's "Fault injection" section provides presets for these.
 - **Retries:** a step that fails with a transient error is retried up to 3 attempts in total, waiting 0.1s and then 0.2s between attempts. Every attempt reuses the step's idempotency key, so the refund ledger records each refund at most once.
 - **Exhausted retries:** if `issue_refund` runs out of retries after its write may have committed, the run fails with `outcome_unknown: true` and the idempotency key in its failure events. The UI shows this as **Outcome unknown**.
+
+## Interruption and resume
+
+The engine is re-entrant: a step left `started` is re-run with its original idempotency key, and the ledger replays a key it already has instead of writing a second refund. To make this visible, the `interrupt_after_commit` fault (UI preset *Simulated interruption after commit*) stops the run at one known point: after the step's tool call, so for `issue_refund` after the ledger write has committed, but before the step is recorded as succeeded. It is the same window the crash tests cover.
+
+The request that hit the interruption returns normally with status `running`, and the run records a `run_interrupted` event with the step and key. Run responses also carry `interrupted`, derived from the events: true while the run is `running` and its latest interrupt or resume event is `run_interrupted`. The status itself stays `running`; the UI shows such runs as **Interrupted**. Nothing else happens until someone resumes it: `POST /runs/{id}/resume`, or **Resume run** in the UI. That records `run_resumed`, re-runs the step with the same key and attempt number, and finishes the run. The run detail then shows one ledger row under that key, and the step history has no duplicate step. The interruption fires once per step, so the resumed attempt completes.
+
+This is a simulated stop at a fixed boundary inside a live process. It does not show the service surviving a real process restart: on Render's free tier the SQLite file is ephemeral, so a restart deletes the run along with everything else.
+
+Only one `advance` can drive a run at a time. Starting, approving and resuming each take a lease on the run (`runs.lease_token`) in a write transaction and release it when advancing stops, including on errors. A second caller gets HTTP 409. If a process is killed mid-run, its lease expires after 60 seconds, which is far longer than a run takes, and the run can then be resumed.
 
 ## Tests
 
@@ -157,7 +169,7 @@ npm run build   # type-check and production build
 
 - **This is a public, shared simulation.** There is no authentication: `decided_by` is free text, and any visitor can create, approve or reject any run, or inject faults. The UI says so in a banner, and the run cap limits how much data visitors can create.
 - Data lasts only as long as the server process (see Deploy).
-- There is no API to resume a run that stopped mid-step (status `running` after a crash), and no reconciliation for `outcome_unknown` runs.
+- Resume is manual. Nothing finds and resumes `running` runs automatically after a crash, and there is no reconciliation for `outcome_unknown` runs.
 - The run list shows `outcome_unknown` runs as `Failed`, because the list endpoint doesn't include events. The run detail view does distinguish them.
 - The UI doesn't poll. Use Refresh or Reload to see changes made elsewhere.
 - Orders, customers and the payment ledger are mocks. There are no external integrations.
