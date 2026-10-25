@@ -1,4 +1,7 @@
+import subprocess
+import sys
 import threading
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -152,3 +155,65 @@ def test_interrupted_flag_follows_persisted_events(conn):
     assert flags()[run_id] == ("running", False)
     assert engine.resume(conn, run_id) == "succeeded"
     assert flags()[run_id] == ("succeeded", False)
+
+
+# Child process: starts a run and parks right after issue_refund's ledger commit,
+# before the step is recorded, so the parent can kill it at that point.
+CHILD = """
+import sys, time
+from aegisflow import engine
+from aegisflow.db import connect
+from aegisflow.models import Scenario
+
+conn = connect(sys.argv[1])
+
+def park(point, name):
+    if point == "after_tool" and name == "issue_refund":
+        print(conn.execute("SELECT id FROM runs").fetchone()[0], flush=True)
+        time.sleep(120)
+
+engine.start_run(conn, "ORD-1001", Scenario(), hook=park)
+"""
+
+
+def test_resume_after_real_process_death(db_path, monkeypatch):
+    child = subprocess.Popen([sys.executable, "-c", CHILD, db_path], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+    try:
+        run_id = child.stdout.readline().strip()
+        assert run_id, child.stderr.read()
+    finally:
+        child.kill()  # TerminateProcess / SIGKILL: no finally blocks, no lease release.
+        child.wait(10)
+    assert child.returncode != 0
+
+    conn = connect(db_path)  # Fresh connection in a different process from the one that died.
+    [refund] = refunds(conn)
+    stuck = steps(conn, run_id)[4]
+    assert (stuck["name"], stuck["status"], stuck["attempt"]) == ("issue_refund", "started", 1)
+    key = stuck["idempotency_key"]
+    assert refund["idempotency_key"] == key
+    assert lease(conn, run_id) is not None  # Abandoned by the killed process.
+    with pytest.raises(engine.Conflict, match="already being advanced"):
+        engine.resume(conn, run_id)
+
+    later = (datetime.now(UTC) + timedelta(seconds=engine.LEASE_S + 1)).isoformat()
+    monkeypatch.setattr(engine, "now", lambda: later)  # The abandoned lease has now expired.
+    assert engine.resume(conn, run_id) == "succeeded"
+
+    assert refunds(conn) == [refund]
+    final = steps(conn, run_id)
+    assert [s["name"] for s in final] == PIPELINE
+    assert all(s["status"] == "succeeded" for s in final)
+    assert (final[4]["idempotency_key"], final[4]["attempt"]) == (key, 1)
+    history = events(conn, run_id)
+    assert [e.seq for e in history] == list(range(1, len(history) + 1))
+    assert [(e.type, e.payload.get("idx")) for e in history] == [("run_created", None)] + [
+        (t, i) for i in range(4) for t in ("step_started", "step_succeeded")
+    ] + [
+        ("step_started", 4), ("run_resumed", 4), ("step_succeeded", 4),
+        ("step_started", 5), ("step_succeeded", 5), ("run_succeeded", None),
+    ]
+    assert history[10].type == "run_resumed" and history[10].payload["idempotency_key"] == key
+    assert lease(conn, run_id) is None
+    conn.close()
