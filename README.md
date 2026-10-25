@@ -1,30 +1,52 @@
 # AegisFlow
 
-A local-first runtime for deterministic, resumable and auditable refund workflow runs, with a web UI for creating runs, looking at their history and making human approval decisions.
+A small workflow runtime that issues refunds through six recorded steps and stays correct when things go wrong: transient faults, a crash after the payment write, a human approval gate, or a process killed mid-run. Every step gets a stable idempotency key, so retries and resumes never write a second refund.
 
-## Architecture
+**Live demo:** https://aegisflow-075f.onrender.com (shared simulation on Render's free tier; the first visit may take about a minute to wake the service)
+
+![An interrupted run: steps 0–3 succeeded, issue_refund interrupted after its ledger write, with the idempotency key and a Resume action](docs/screenshots/interrupted-run.png)
+
+*A run stopped right after `issue_refund` wrote to the simulated ledger and before the step was recorded. Resuming re-runs the step with the same key; the ledger replays it instead of writing a second refund.*
+
+The refunds, orders, payment ledger and notifications are all simulated. Nothing calls an external system, and no LLM is involved: the pipeline and its decisions are deterministic.
+
+## What it demonstrates
+
+The interesting part is the window between "the payment system committed" and "the workflow recorded that it committed". A crash, timeout or retry in that window is where duplicate payments come from. AegisFlow handles it like this:
+
+- **Stable idempotency keys.** Step *n* of a run always uses `{run_id}:{n}`. Retries and resumes reuse it. The ledger (written in its own transaction, as an external payment system would) replays a key it has already seen, and a reused key with a different order or amount is a fatal error.
+- **Re-entrant execution.** A step left `started` is simply run again under its key. Earlier completed steps are never repeated.
+- **Bounded, deterministic retries.** Transient faults retry up to 3 attempts in total (0.1 s, then 0.2 s; no jitter). Fatal faults fail the run immediately. If `issue_refund` exhausts its retries after its write may have committed, the run fails with `outcome_unknown: true` and the key, instead of claiming success or failure.
+- **Human approval.** Refunds strictly above the scenario threshold (default ₹5,000), or flagged for manual review, pause before `issue_refund`. Only the first decision applies; a second one gets HTTP 409.
+- **Single driver per run.** Starting, approving and resuming take a lease on the run inside a write transaction. A concurrent caller gets HTTP 409. A lease left by a killed process expires after 60 seconds.
+- **Audit history.** Every transition is appended to an ordered event log, shown in the UI next to the ledger rows written under the run's keys.
+
+![Scenario presets and the six-step pipeline](docs/screenshots/scenarios.png)
+
+### Execution of one step
 
 ```
-frontend/  React + TypeScript (Vite). Talks to the API through /api.
-backend/   FastAPI + SQLite.
-  aegisflow/api.py      HTTP endpoints
-  aegisflow/engine.py   run state machine, retries, approvals, event log
-  aegisflow/planner.py  fixed step pipeline and approval policy
-  aegisflow/tools.py    deterministic mock tools, mock orders and refund ledger
-  aegisflow/db.py       schema and migrations
+step n ──► record step_started, key = {run_id}:{n}
+        ──► tool call  (issue_refund commits its ledger row here, under the key)
+        ──►   ◄── crash / interruption / timeout window ──►
+        ──► record step_succeeded, checkpoint, move to step n+1
+
+Retry or resume inside the window: same key ─► ledger replays the existing row ─► one refund
 ```
 
-Each run executes this pipeline: `fetch_order → fetch_customer → check_refund_policy → propose_refund → issue_refund → notify_customer`.
+## Recovery experiment
 
-Runs, steps, events, checkpoints, approvals and the mock refund ledger are stored in one SQLite file. All amounts are integer paise.
+You can reproduce three levels of failure, from simulated to real.
 
-The frontend always calls the API at `/api`, and the backend has no CORS:
-- In development, the Vite dev and preview servers proxy `/api/*` to `http://127.0.0.1:8000`.
-- In production, `create_site()` serves the API under `/api` and the built frontend at `/`, all from one process on one origin.
+1. **Simulated interruption (UI or API).** Choose *Interruption and resume* and start the run. The `interrupt_after_commit` fault stops the run after `issue_refund`'s ledger write and before the step is recorded. The run stays `running`, records `run_interrupted` with the key, and the UI shows **Interrupted** with a **Resume run** button. Resuming (`POST /runs/{id}/resume`) records `run_resumed`, re-runs step 4 with the same key and attempt number, and finishes with one ledger row. This is a stop at a fixed point inside a live process, not a restart.
+2. **Retry after commit.** The *Retry after commit* preset makes the refund commit and then time out once. The retry reuses the key and the ledger still has one row.
+3. **Real process death (test).** `test_resume_after_real_process_death` in [`backend/tests/test_recovery.py`](backend/tests/test_recovery.py) starts a run in a child Python process, waits until it has committed the refund, and kills it (`TerminateProcess`/`SIGKILL`, so no cleanup runs). From a fresh connection the test then checks:
+   - exactly one refund, step 4 still `started`, and the dead process's lease still held, so `resume` is refused with a conflict;
+   - after the lease expiry time has passed (the test advances the engine's clock past 60 s rather than sleeping), `resume` succeeds, reuses the same key, leaves one refund, and produces the exact expected event sequence.
 
-All workflow tools are simulated. Orders and customers are in-memory fixtures, the refund "payment system" is a table in the same SQLite file, and notifications only return the message text. Nothing makes a network call.
+Recovery after process death needs two things: the SQLite file must survive, and someone must call resume after the lease expires. Nothing resumes runs automatically.
 
-## Setup (Windows PowerShell)
+## Run it locally (Windows PowerShell)
 
 You need Python 3.11+ and Node.js 20.19+.
 
@@ -37,21 +59,19 @@ cd ..\frontend
 npm install
 ```
 
-## Run locally
-
-Use two terminals.
+Development, in two terminals:
 
 ```powershell
-# 1. API on http://127.0.0.1:8000 (database: $env:AEGISFLOW_DB, default .\aegisflow.db)
+# API on http://127.0.0.1:8000 (SQLite file: $env:AEGISFLOW_DB, default .\aegisflow.db)
 cd backend
 .venv\Scripts\python.exe -m uvicorn aegisflow.api:create_app --factory --port 8000
 
-# 2. UI on http://localhost:5173
+# UI on http://localhost:5173 (proxies /api to :8000)
 cd frontend
 npm run dev
 ```
 
-To run it the way it is deployed (one process serving the API and UI), run this from the repo root:
+As deployed, one process serving the API and the built UI, from the repo root:
 
 ```powershell
 npm run build --prefix frontend
@@ -59,118 +79,78 @@ backend\.venv\Scripts\python.exe -m uvicorn aegisflow.api:create_site --factory 
 # open http://127.0.0.1:8000
 ```
 
-### Environment variables
+### Tests
 
-All are optional.
+```powershell
+cd backend
+.venv\Scripts\python.exe -m pytest -q   # engine, retries, recovery and API tests
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `AEGISFLOW_DB` | `aegisflow.db` (current directory) | SQLite file path |
-| `AEGISFLOW_MAX_RUNS` | unset (unlimited) | Once this many runs exist, `POST /runs` returns 429 |
-| `AEGISFLOW_FRONTEND_DIST` | `frontend/dist` in the source tree | Built UI served by `create_site` |
+cd ..\frontend
+npm run build                            # type-check and production build
+```
 
-## Deploy (Render free tier, ₹0)
+The backend tests check behaviour and invariants: ledger rows, step and event history, terminal states, lease conflicts, concurrent approvals, migration of an older database, and the crash windows above. Tests never really sleep; backoff is replaced by a fixture.
 
-`render.yaml` defines a single free Python web service:
-- **Build:** `pip install -e ./backend`, then `npm ci` and `npm run build` in `frontend/`. Render's native runtimes include Node.
-- **Start:** `uvicorn aegisflow.api:create_site --factory --host 0.0.0.0 --port $PORT`
-- **Health check:** `GET /api/health`
-- **Settings:** pins `PYTHON_VERSION=3.11.15` and sets `AEGISFLOW_MAX_RUNS=500`.
+## Architecture
 
-To deploy:
-1. Push this repository to GitHub (or GitLab/Bitbucket).
-2. In the Render Dashboard, choose **New → Blueprint** and select the repository. Render reads `render.yaml`, creates the `aegisflow` service, and deploys every push to the default branch.
+```
+frontend/  React + TypeScript (Vite). Calls the API at /api.
+backend/   FastAPI, Pydantic v2, SQLite.
+  aegisflow/engine.py   run state machine, retries, approvals, leases, event log
+  aegisflow/planner.py  fixed six-step pipeline and approval policy
+  aegisflow/tools.py    deterministic mock tools, orders, customers, refund ledger
+  aegisflow/db.py       schema and migrations
+  aegisflow/api.py      HTTP layer; create_site serves the API at /api and the UI at /
+```
 
-What the free tier means for this demo (see [Render's free tier documentation](https://render.com/docs/free)):
-- **Data is temporary.** The filesystem is ephemeral, so the SQLite database is wiped on every deploy, restart and spin-down. That is the demo's reset behavior; nothing is meant to persist beyond the process.
-- **Cold starts.** The service spins down after 15 minutes without traffic. The next visit waits about a minute while it starts again.
-- **Small instance.** A single instance with 512 MB of memory.
+Pipeline: `fetch_order → fetch_customer → check_refund_policy → propose_refund → issue_refund → notify_customer`.
+
+Runs, steps, events, checkpoints, approvals and the refund ledger live in one SQLite file. Money is integer paise everywhere.
 
 ### API
+
+Paths are relative to the API root: `http://127.0.0.1:8000` with `create_app`, or `/api` with `create_site` and the dev proxy.
 
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/runs` | Create and run a workflow: `{order_id, scenario?}` |
 | GET | `/runs` | List runs |
-| GET | `/runs/{id}` | Run detail with steps and any pending approval |
+| GET | `/runs/{id}` | Run detail with steps, pending approval and ledger rows (`refunds`) |
 | GET | `/runs/{id}/events` | Ordered event history |
-| GET | `/health` | Liveness and database check |
 | POST | `/runs/{id}/approve` | `{decided_by}` |
 | POST | `/runs/{id}/reject` | `{decided_by, reason?}` |
-| POST | `/runs/{id}/resume` | Continue a run left `running` by an interruption (409 if it isn't `running` or is already being advanced) |
+| POST | `/runs/{id}/resume` | Continue an interrupted `running` run (409 if not `running` or already being advanced) |
+| GET | `/health` | Liveness and database check |
 
-These paths are relative to the API root: `http://127.0.0.1:8000` with `create_app`, or `/api` with `create_site` and the dev proxy.
+Runs execute synchronously: `POST /runs`, `/approve` and `/resume` return once the run has finished, failed, paused for approval or been interrupted.
 
-Runs execute synchronously. `POST /runs`, `/approve` and `/resume` return only when the run has succeeded, failed, paused for approval, or been interrupted (status `running`). `GET /runs/{id}` includes `refunds`, the ledger rows written under the run's idempotency keys.
+A scenario sets `approval_threshold_paise`, `require_manual_review` and `faults`, which maps a step name to the outcome of each attempt: `retryable`, `fatal`, `retryable_after_commit` or `interrupt_after_commit`.
 
-Input limits:
-- `order_id`: at most 64 characters
-- `decided_by`: at most 100 characters
-- `reason`: at most 500 characters
-- each step's fault list: at most 10 entries
+### Demo orders
 
-## Demo data
-
-The mock orders are defined in `backend/aegisflow/tools.py`:
-
-| Order | Amount | Behavior with default scenario |
+| Order | Amount | Default scenario |
 |---|---|---|
 | ORD-1001 | ₹1,299 | Completes without approval |
 | ORD-2002 | ₹12,000 | Pauses for approval |
 | ORD-3003 | ₹499 | Pauses for approval (order flagged for manual review) |
-| ORD-4004 | ₹5,000 | Completes (the threshold check is strictly greater than) |
-| ORD-9009 | cancelled | Fails: not refundable |
+| ORD-4004 | ₹5,000 | Completes (the threshold is strictly greater than) |
+| ORD-9009 | cancelled | Fails the policy check |
 
-## Human approval
+## Deployment
 
-Before `issue_refund`, a run pauses with status `awaiting_approval` in either of these cases:
-- the refund is strictly greater than `scenario.approval_threshold_paise` (default ₹5,000), or
-- manual review is required by the scenario or by the order.
+[`render.yaml`](render.yaml) defines one free Render web service. It builds the backend and frontend, starts `uvicorn aegisflow.api:create_site`, health-checks `/api/health`, and caps the demo at 500 runs (`AEGISFLOW_MAX_RUNS`; further `POST /runs` return 429). Every push to `master` redeploys it.
 
-In the UI, open the run and enter who is deciding. Then:
-- **Approve** resumes the run from its checkpoint and issues the refund. Earlier steps don't run again.
-- **Reject** ends the run as `rejected`, and no refund is issued.
+| Variable | Default | Purpose |
+|---|---|---|
+| `AEGISFLOW_DB` | `aegisflow.db` in the current directory | SQLite file path |
+| `AEGISFLOW_MAX_RUNS` | unlimited | Run cap for the public demo |
+| `AEGISFLOW_FRONTEND_DIST` | `frontend/dist` in the source tree | Built UI served by `create_site` |
 
-Only the first decision counts; any later one gets HTTP 409.
+## Limitations
 
-## Retries and fault injection
-
-- **Fault injection:** `scenario.faults` maps a step name to the outcome of each attempt:
-  - `retryable` fails that attempt with a transient error.
-  - `fatal` fails the run without retrying.
-  - `retryable_after_commit` runs the step, so the refund is written to the ledger, and then fails with a transient error.
-  - `interrupt_after_commit` runs the step and then stops the run before the step is recorded as succeeded (see below).
-
-  The UI's "Fault injection" section provides presets for these.
-- **Retries:** a step that fails with a transient error is retried up to 3 attempts in total, waiting 0.1s and then 0.2s between attempts. Every attempt reuses the step's idempotency key, so the refund ledger records each refund at most once.
-- **Exhausted retries:** if `issue_refund` runs out of retries after its write may have committed, the run fails with `outcome_unknown: true` and the idempotency key in its failure events. The UI shows this as **Outcome unknown**.
-
-## Interruption and resume
-
-The engine is re-entrant: a step left `started` is re-run with its original idempotency key, and the ledger replays a key it already has instead of writing a second refund. To make this visible, the `interrupt_after_commit` fault (UI preset *Simulated interruption after commit*) stops the run at one known point: after the step's tool call, so for `issue_refund` after the ledger write has committed, but before the step is recorded as succeeded. It is the same window the crash tests cover.
-
-The request that hit the interruption returns normally with status `running`, and the run records a `run_interrupted` event with the step and key. Run responses also carry `interrupted`, derived from the events: true while the run is `running` and its latest interrupt or resume event is `run_interrupted`. The status itself stays `running`; the UI shows such runs as **Interrupted**. Nothing else happens until someone resumes it: `POST /runs/{id}/resume`, or **Resume run** in the UI. That records `run_resumed`, re-runs the step with the same key and attempt number, and finishes the run. The run detail then shows one ledger row under that key, and the step history has no duplicate step. The interruption fires once per step, so the resumed attempt completes.
-
-This is a simulated stop at a fixed boundary inside a live process. It does not show the service surviving a real process restart: on Render's free tier the SQLite file is ephemeral, so a restart deletes the run along with everything else.
-
-Only one `advance` can drive a run at a time. Starting, approving and resuming each take a lease on the run (`runs.lease_token`) in a write transaction and release it when advancing stops, including on errors. A second caller gets HTTP 409. If a process is killed mid-run, its lease expires after 60 seconds, which is far longer than a run takes, and the run can then be resumed.
-
-## Tests
-
-```powershell
-cd backend
-.venv\Scripts\python.exe -m pytest -q
-
-cd ..\frontend
-npm run build   # type-check and production build
-```
-
-## Known limitations
-
-- **This is a public, shared simulation.** There is no authentication: `decided_by` is free text, and any visitor can create, approve or reject any run, or inject faults. The UI says so in a banner, and the run cap limits how much data visitors can create.
-- Data lasts only as long as the server process (see Deploy).
-- Resume is manual. Nothing finds and resumes `running` runs automatically after a crash, and there is no reconciliation for `outcome_unknown` runs.
-- The run list shows `outcome_unknown` runs as `Failed`, because the list endpoint doesn't include events. The run detail view does distinguish them.
-- The UI doesn't poll. Use Refresh or Reload to see changes made elsewhere.
-- Orders, customers and the payment ledger are mocks. There are no external integrations.
-- The frontend has no automated tests in the repository. It is checked by the TypeScript build and by manual end-to-end runs against the real backend.
+- **Simulated integrations.** Orders, customers, the payment ledger and notifications are local mocks in the same SQLite file. There are no real payments, messages or external APIs.
+- **Ephemeral public demo.** Render's free tier has no persistent disk, so the database is wiped on every deploy, restart and idle spin-down. The live demo does not demonstrate recovery across a restart; the process-death recovery is shown by the test against a surviving local database.
+- **Manual recovery.** Nothing scans for and resumes stuck runs, and there is no reconciliation for `outcome_unknown` runs.
+- **Shared, unauthenticated demo.** Anyone can create, approve, reject or resume any run; `decided_by` is free text.
+- **Single SQLite process.** The lease guards concurrent callers on one database file. This is not a distributed system, and there are no performance or scale measurements.
+- **UI gaps.** The run list shows `outcome_unknown` runs as `Failed` (the list endpoint carries no events), the UI doesn't poll, and the frontend has no automated tests in the repository; it is checked by the TypeScript build and by browser runs against a local backend.
