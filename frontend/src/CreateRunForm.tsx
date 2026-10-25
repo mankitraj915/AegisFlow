@@ -25,15 +25,73 @@ const FAULT_PRESETS: Record<string, { label: string; plan: FaultKind[] }> = {
   interrupt: { label: "Simulated interruption after commit (resume manually)", plan: ["interrupt_after_commit"] },
 };
 
+interface Config {
+  orderId: string;
+  thresholdRupees: string;
+  manualReview: boolean;
+  faults: Record<string, string>; // step -> FAULT_PRESETS key
+}
+
+// Each scenario is only a form configuration of behavior the backend supports.
+const SCENARIOS: { key: string; title: string; what: string; config: Config }[] = [
+  {
+    key: "complete",
+    title: "Clean completion",
+    what: "ORD-1001, ₹1,299. All six steps succeed without approval.",
+    config: { orderId: "ORD-1001", thresholdRupees: "5000", manualReview: false, faults: {} },
+  },
+  {
+    key: "approval",
+    title: "Approval required",
+    what: "ORD-2002, ₹12,000 is over the ₹5,000 threshold, so the run pauses before the refund.",
+    config: { orderId: "ORD-2002", thresholdRupees: "5000", manualReview: false, faults: {} },
+  },
+  {
+    key: "retry",
+    title: "Retry after commit",
+    what: "The refund commits, then times out once. The retry reuses the key: one ledger entry.",
+    config: { orderId: "ORD-1001", thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "commit_once" } },
+  },
+  {
+    key: "unknown",
+    title: "Outcome unknown",
+    what: "The refund times out after commit on all 3 attempts. The run fails with its outcome unknown.",
+    config: { orderId: "ORD-1001", thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "commit_exhaust" } },
+  },
+  {
+    key: "interrupt",
+    title: "Interruption and resume",
+    what: "The run stops after the ledger write, before the step is recorded. Resume it to finish.",
+    config: { orderId: "ORD-1001", thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "interrupt" } },
+  },
+  {
+    key: "policy",
+    title: "Policy failure",
+    what: "ORD-9009 was cancelled, so the policy check fails the run before any refund.",
+    config: { orderId: "ORD-9009", thresholdRupees: "5000", manualReview: false, faults: {} },
+  },
+];
+
 type Errors = { order?: string; threshold?: string; submit?: string };
 
 export function CreateRunForm({ onCreated }: { onCreated: (run: Run) => void }) {
-  const [orderId, setOrderId] = useState("ORD-1001");
-  const [thresholdRupees, setThresholdRupees] = useState("5000");
-  const [manualReview, setManualReview] = useState(false);
-  const [faults, setFaults] = useState<Record<string, string>>({});
+  const [scenario, setScenario] = useState<string | null>("complete");
+  const [config, setConfig] = useState<Config>(SCENARIOS[0].config);
   const [errors, setErrors] = useState<Errors>({});
   const [submitting, setSubmitting] = useState(false);
+  const { orderId, thresholdRupees, manualReview, faults } = config;
+
+  // Any manual edit turns the selection into a custom configuration.
+  const edit = (patch: Partial<Config>) => {
+    setConfig({ ...config, ...patch });
+    setScenario(null);
+  };
+
+  function choose(key: string) {
+    setConfig(SCENARIOS.find((s) => s.key === key)!.config);
+    setScenario(key);
+    setErrors({});
+  }
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -62,64 +120,92 @@ export function CreateRunForm({ onCreated }: { onCreated: (run: Run) => void }) 
     }
   }
 
-  const activeFaults = Object.values(faults).filter((p) => p !== "none").length;
+  const activeFaults = Object.entries(faults).filter(([, p]) => p !== "none");
 
   return (
-    <form className="panel" onSubmit={submit} noValidate aria-labelledby="create-title">
-      <h2 id="create-title">New refund run</h2>
+    <form className="composer" onSubmit={submit} noValidate aria-labelledby="create-title">
+      <h2 id="create-title" className="section-title">Start a run</h2>
 
-      <label htmlFor="order-id">Order id</label>
-      <input
-        id="order-id"
-        list="demo-orders"
-        value={orderId}
-        onChange={(e) => setOrderId(e.target.value)}
-        aria-invalid={!!errors.order}
-        aria-describedby={errors.order ? "order-error" : undefined}
-        autoComplete="off"
-        spellCheck={false}
-      />
-      <datalist id="demo-orders">
-        {DEMO_ORDERS.map(([id, note]) => (
-          <option key={id} value={id}>
-            {note}
-          </option>
+      <fieldset className="scenarios">
+        <legend className="label">Scenario</legend>
+        {SCENARIOS.map((s) => (
+          <label key={s.key} className="scenario">
+            <input
+              type="radio"
+              name="scenario"
+              value={s.key}
+              checked={scenario === s.key}
+              onChange={() => choose(s.key)}
+            />
+            <span className="scenario-text">
+              <span className="scenario-title">{s.title}</span>
+              <span className="scenario-what">{s.what}</span>
+            </span>
+          </label>
         ))}
-      </datalist>
-      {errors.order && <p id="order-error" className="field-error">{errors.order}</p>}
+        {scenario === null && <p className="hint custom-note">Custom configuration: you have edited the fields below.</p>}
+      </fieldset>
 
-      <label htmlFor="threshold">Approval threshold (₹)</label>
-      <input
-        id="threshold"
-        inputMode="numeric"
-        value={thresholdRupees}
-        onChange={(e) => setThresholdRupees(e.target.value)}
-        aria-invalid={!!errors.threshold}
-        aria-describedby={errors.threshold ? "threshold-error" : "threshold-hint"}
-      />
-      {errors.threshold ? (
-        <p id="threshold-error" className="field-error">{errors.threshold}</p>
-      ) : (
-        <p id="threshold-hint" className="hint">Refunds strictly above this need approval.</p>
-      )}
+      <div className="fields">
+        <div className="field">
+          <label htmlFor="order-id">Order id</label>
+          <input
+            id="order-id"
+            className="mono"
+            list="demo-orders"
+            value={orderId}
+            onChange={(e) => edit({ orderId: e.target.value })}
+            aria-invalid={!!errors.order}
+            aria-describedby={errors.order ? "order-error" : undefined}
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <datalist id="demo-orders">
+            {DEMO_ORDERS.map(([id, note]) => (
+              <option key={id} value={id}>
+                {note}
+              </option>
+            ))}
+          </datalist>
+          {errors.order && <p id="order-error" className="field-error">{errors.order}</p>}
+        </div>
+
+        <div className="field">
+          <label htmlFor="threshold">Approval threshold (₹)</label>
+          <input
+            id="threshold"
+            inputMode="numeric"
+            value={thresholdRupees}
+            onChange={(e) => edit({ thresholdRupees: e.target.value })}
+            aria-invalid={!!errors.threshold}
+            aria-describedby={errors.threshold ? "threshold-error" : "threshold-hint"}
+          />
+          {errors.threshold ? (
+            <p id="threshold-error" className="field-error">{errors.threshold}</p>
+          ) : (
+            <p id="threshold-hint" className="hint">Refunds strictly above this need approval.</p>
+          )}
+        </div>
+      </div>
 
       <label className="checkbox">
-        <input type="checkbox" checked={manualReview} onChange={(e) => setManualReview(e.target.checked)} />
+        <input type="checkbox" checked={manualReview} onChange={(e) => edit({ manualReview: e.target.checked })} />
         Require manual review
       </label>
 
       <details className="faults">
         <summary>
-          Fault injection{activeFaults > 0 && <span className="count"> · {activeFaults} active</span>}
+          Per-step fault injection
+          {activeFaults.length > 0 && <span className="fault-count"> · {activeFaults.length} active</span>}
         </summary>
-        <p className="hint">Deterministic mock failures per step, saved with the run.</p>
+        <p className="hint">Deterministic outcomes for each attempt of a step, saved with the run.</p>
         {PIPELINE.map((step) => (
           <div className="fault-row" key={step}>
             <label htmlFor={`fault-${step}`} className="mono">{step}</label>
             <select
               id={`fault-${step}`}
               value={faults[step] ?? "none"}
-              onChange={(e) => setFaults({ ...faults, [step]: e.target.value })}
+              onChange={(e) => edit({ faults: { ...faults, [step]: e.target.value } })}
             >
               {Object.entries(FAULT_PRESETS).map(([key, { label }]) => (
                 <option key={key} value={key}>{label}</option>
@@ -129,10 +215,16 @@ export function CreateRunForm({ onCreated }: { onCreated: (run: Run) => void }) 
         ))}
       </details>
 
-      {errors.submit && <p className="alert alert-error" role="alert">{errors.submit}</p>}
+      {activeFaults.length > 0 && (
+        <p className="hint fault-summary">
+          Faults: {activeFaults.map(([step, p]) => `${step}: ${FAULT_PRESETS[p].label.toLowerCase()}`).join("; ")}
+        </p>
+      )}
+      {errors.submit && <p className="alert tone-fail" role="alert">{errors.submit}</p>}
       <button type="submit" className="primary" disabled={submitting}>
         {submitting ? "Running…" : "Start run"}
       </button>
+      <p className="hint">The run executes as soon as you start it.</p>
     </form>
   );
 }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, messageOf, type Run } from "./api";
+import { api, messageOf, PIPELINE, type Run } from "./api";
 import { CreateRunForm } from "./CreateRunForm";
+import { Ident, STEP_INFO } from "./format";
 import { RunDetail } from "./RunDetail";
 import { RunList } from "./RunList";
 
@@ -33,20 +34,34 @@ export default function App() {
 
   const select = (id: string) => {
     location.hash = `/runs/${id}`;
+    // In the single-column layout the run detail sits below the form; bring it into view.
+    if (matchMedia("(max-width: 1099px)").matches) {
+      const smooth = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+      requestAnimationFrame(() =>
+        document.getElementById("run-view")?.scrollIntoView({ behavior: smooth ? "smooth" : "auto" }),
+      );
+    }
   };
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <h1>AegisFlow</h1>
-        <span className="muted">Refund workflow runs</span>
+    <div className="shell">
+      <header className="masthead">
+        <div className="brand">
+          <h1>AegisFlow</h1>
+          <span className="brand-sub">refund workflow runtime</span>
+        </div>
+        <p className="lede">
+          Each refund runs as six recorded steps. Choose a scenario to retry, interrupt, approve or resume a run, then
+          check the evidence: every step gets one idempotency key, so the ledger records a refund at most once.
+        </p>
+        <p className="disclosure">
+          <strong>Shared simulation.</strong> No money moves and no messages are sent. Every visitor sees and can act
+          on the same runs, and the free server deletes all data when it restarts.
+        </p>
       </header>
-      <p className="notice">
-        Public demo. Orders, refunds and notifications are simulated: no money moves and no messages are sent.
-        Everyone shares the same runs, and data is kept only until the server restarts.
-      </p>
+
       <main className="layout">
-        <div className="sidebar">
+        <div className="side">
           <CreateRunForm
             onCreated={(run) => {
               loadRuns();
@@ -55,43 +70,52 @@ export default function App() {
           />
           <RunList runs={runs} error={listError} selectedId={selectedId} onSelect={select} onReload={loadRuns} />
         </div>
-        {selectedId ? (
-          <RunDetail runId={selectedId} onChanged={loadRuns} />
-        ) : (
-          <section className="panel guide" aria-labelledby="guide-title">
-            <h2 id="guide-title">What this shows</h2>
-            <p>
-              Each run is a persisted state machine over six steps, from <span className="mono">fetch_order</span> to{" "}
-              <span className="mono">notify_customer</span>. Every step records its input, output, attempts and
-              idempotency key, and every transition is appended to an ordered event log.
-            </p>
-            <h3>Try</h3>
-            <ul>
-              <li><span className="mono">ORD-1001</span>: completes all six steps without approval.</li>
-              <li>
-                <span className="mono">ORD-2002</span>: ₹12,000 is over the ₹5,000 threshold, so the run pauses
-                before the refund until you approve or reject it.
-              </li>
-              <li>
-                <span className="mono">ORD-1001</span> with <em>Times out after commit, once</em> on{" "}
-                <span className="mono">issue_refund</span>: the refund commits, the step fails, and the retry reuses
-                the same idempotency key, so the simulated ledger records the refund only once.
-              </li>
-              <li>
-                <span className="mono">ORD-1001</span> with <em>Times out after commit, every attempt</em>: retries run
-                out and the run ends as <strong>Outcome unknown</strong>.
-              </li>
-              <li>
-                <span className="mono">ORD-1001</span> with <em>Simulated interruption after commit</em> on{" "}
-                <span className="mono">issue_refund</span>: the refund commits, then the run stops before the step is
-                recorded. Resume it to see the same idempotency key reused and a single ledger entry.
-              </li>
-              <li><span className="mono">ORD-9009</span>: a cancelled order fails the refund policy check.</li>
-            </ul>
-            <p className="muted">Select a run to see its steps, events and approval state.</p>
-          </section>
-        )}
+        <div id="run-view" className="view">
+          {selectedId ? <RunDetail runId={selectedId} onChanged={loadRuns} /> : <Overview />}
+        </div>
       </main>
     </div>
+  );
+}
+
+function Overview() {
+  return (
+    <section className="overview" aria-labelledby="overview-title">
+      <p className="label">How a run executes</p>
+      <h2 id="overview-title" className="view-title">Six steps, each one on the record</h2>
+      <div className="trace">
+        <ol className="rail">
+          {PIPELINE.map((name, idx) => (
+            <li key={name} className="station state-pending">
+              <div className="station-body">
+                <span className="node" aria-hidden="true" />
+                <span className="station-index">{idx}</span>
+                <span className="station-title">{STEP_INFO[name].title}</span>
+                <span className="station-id mono"><Ident>{name}</Ident></span>
+                <span className="station-note">{STEP_INFO[name].does}</span>
+                {name === "issue_refund" && (
+                  <span className="station-gate">Pauses for approval above the threshold or under manual review.</span>
+                )}
+              </div>
+            </li>
+          ))}
+        </ol>
+      </div>
+      <dl className="guarantees">
+        <div>
+          <dt>One key per step</dt>
+          <dd>Step <i>n</i> of a run uses <code>{"{run id}:{n}"}</code>. Retries and resumes reuse it, and the ledger replays a key it already has.</dd>
+        </div>
+        <div>
+          <dt>Bounded retries</dt>
+          <dd>A transient fault is retried up to 3 attempts in total, 0.1 s and then 0.2 s apart. A fatal fault fails the run at once.</dd>
+        </div>
+        <div>
+          <dt>Ordered evidence</dt>
+          <dd>Every transition is appended to the run's event log, next to the ledger rows written under its keys.</dd>
+        </div>
+      </dl>
+      <p className="muted">Choose a scenario and start a run, or select an existing run.</p>
+    </section>
   );
 }

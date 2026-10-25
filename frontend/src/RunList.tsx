@@ -1,5 +1,5 @@
 import type { Run } from "./api";
-import { formatTime, shortId, StatusBadge } from "./format";
+import { displayStatus, formatTime, shortId, StatusMark } from "./format";
 
 interface Props {
   runs: Run[] | null;
@@ -11,17 +11,19 @@ interface Props {
 
 export function RunList({ runs, error, selectedId, onSelect, onReload }: Props) {
   return (
-    <section className="panel" aria-labelledby="runs-title">
-      <div className="panel-head">
-        <h2 id="runs-title">Runs</h2>
-        <button type="button" onClick={onReload}>Refresh</button>
+    <section className="runs" aria-labelledby="runs-title">
+      <div className="section-head">
+        <h2 id="runs-title" className="section-title">
+          Runs{runs && runs.length > 0 && <span className="count"> {runs.length}</span>}
+        </h2>
+        <button type="button" className="quiet" onClick={onReload}>Refresh</button>
       </div>
       {error ? (
-        <p className="alert alert-error" role="alert">{error}</p>
+        <p className="alert tone-fail" role="alert">{error}</p>
       ) : runs === null ? (
         <p className="muted" aria-live="polite">Loading runs…</p>
       ) : runs.length === 0 ? (
-        <p className="muted">No runs yet. Start one above.</p>
+        <p className="muted">No runs yet. Choose a scenario and start one.</p>
       ) : (
         <ul className="run-list">
           {/* The API lists oldest first; show newest first. */}
@@ -33,11 +35,9 @@ export function RunList({ runs, error, selectedId, onSelect, onReload }: Props) 
                 aria-current={run.id === selectedId ? "true" : undefined}
                 onClick={() => onSelect(run.id)}
               >
-                <span className="run-item-main">
-                  <span className="mono">{run.order_id}</span>
-                  <StatusBadge status={run.interrupted ? "interrupted" : run.status} />
-                </span>
-                <span className="run-item-meta">
+                <span className="mono run-order">{run.order_id}</span>
+                <StatusMark status={displayStatus(run)} />
+                <span className="run-meta">
                   <span className="mono">{shortId(run.id)}</span> · {formatTime(run.created_at)}
                 </span>
               </button>
