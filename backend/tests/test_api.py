@@ -79,6 +79,49 @@ def test_interrupt_and_resume_over_api(client):
     assert client.post("/runs/nope/resume").status_code == 404
 
 
+def test_repeated_request_with_a_key_gets_the_same_run(client):
+    headers = {"Idempotency-Key": "client-request-1"}
+    body = {"order_id": "ORD-1001"}
+    first = client.post("/runs", json=body, headers=headers)
+    second = client.post("/runs", json=body, headers=headers)
+    assert (first.status_code, second.status_code) == (201, 200)
+    assert second.json()["id"] == first.json()["id"]
+    assert len(client.get("/runs").json()) == 1
+    assert len(client.get(f"/runs/{first.json()['id']}").json()["refunds"]) == 1
+
+
+def test_key_reused_for_a_different_request_conflicts(client):
+    headers = {"Idempotency-Key": "client-request-1"}
+    assert client.post("/runs", json={"order_id": "ORD-1001"}, headers=headers).status_code == 201
+    assert client.post("/runs", json={"order_id": "ORD-2002"}, headers=headers).status_code == 409
+    r = client.post("/runs", json={"order_id": "ORD-1001", "scenario": {"require_manual_review": True}},
+                    headers=headers)
+    assert r.status_code == 409
+    assert len(client.get("/runs").json()) == 1
+
+
+def test_a_repeat_returns_the_run_as_it_stands_without_driving_it(client):
+    headers = {"Idempotency-Key": "k"}
+    body = {"order_id": "ORD-1001", "scenario": {"faults": {"issue_refund": ["interrupt_after_commit"]}}}
+    first = client.post("/runs", json=body, headers=headers).json()
+    again = client.post("/runs", json=body, headers=headers).json()
+    assert (first["status"], first["interrupted"]) == ("running", True)
+    assert (again["id"], again["status"], again["interrupted"]) == (first["id"], "running", True)
+
+
+def test_a_repeat_still_answers_at_the_run_cap(db_path):
+    client = TestClient(create_app(db_path, max_runs=1))
+    headers = {"Idempotency-Key": "k"}
+    assert client.post("/runs", json={"order_id": "ORD-1001"}, headers=headers).status_code == 201
+    assert client.post("/runs", json={"order_id": "ORD-1001"}, headers=headers).status_code == 200
+    assert client.post("/runs", json={"order_id": "ORD-2002"}).status_code == 429
+
+
+def test_key_is_bounded(client):
+    r = client.post("/runs", json={"order_id": "ORD-1001"}, headers={"Idempotency-Key": "k" * 201})
+    assert r.status_code == 422
+
+
 def test_error_contract(client):
     assert client.get("/runs/nope").status_code == 404
     assert client.get("/runs/nope/events").status_code == 404

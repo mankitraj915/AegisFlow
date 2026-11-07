@@ -1,7 +1,8 @@
 import os
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import engine
@@ -42,11 +43,19 @@ def create_app(db_path: str | None = None, max_runs: int | None = None) -> FastA
         return {"status": "ok"}
 
     @app.post("/runs", response_model=RunOut, status_code=201)
-    def create_run(body: CreateRun, conn=Depends(get_conn)):
+    def create_run(
+        body: CreateRun,
+        response: Response,
+        idempotency_key: Annotated[str | None, Header(min_length=1, max_length=200)] = None,
+        conn=Depends(get_conn),
+    ):
+        replay = idempotency_key is not None and engine.run_id_for_key(conn, idempotency_key) is not None
         # Bounds database growth on a shared public demo; unset means unlimited.
-        if max_runs is not None and engine.count_runs(conn) >= max_runs:
+        if not replay and max_runs is not None and engine.count_runs(conn) >= max_runs:
             raise HTTPException(429, f"This demo is limited to {max_runs} runs. It resets when the server restarts.")
-        run_id = guarded(engine.start_run, conn, body.order_id, body.scenario)
+        run_id, created = guarded(engine.start_run_once, conn, body.order_id, body.scenario, idempotency_key)
+        if not created:
+            response.status_code = 200  # A repeat of an earlier request: the same run, nothing new.
         return engine.get_run(conn, run_id)
 
     @app.get("/runs", response_model=list[RunOut])

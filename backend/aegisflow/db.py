@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from . import runtime
 
 SYNCHRONOUS = "FULL"
-SCHEMA_VERSION = 4 # Raise whenever _migrate gains a step.
+SCHEMA_VERSION = 5 # Raise whenever _migrate gains a step.
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -118,6 +118,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if "next_attempt_at" not in cols:
             # When a step's backoff ends, so it survives whoever was sleeping through it.
             conn.execute("ALTER TABLE steps ADD COLUMN next_attempt_at TEXT")
+        if "idempotency_key" not in run_cols:
+            # One run per client request: see engine.start_run_once.
+            conn.execute("ALTER TABLE runs ADD COLUMN idempotency_key TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS runs_idempotency_key ON runs(idempotency_key) "
+            "WHERE idempotency_key IS NOT NULL"
+        )
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 

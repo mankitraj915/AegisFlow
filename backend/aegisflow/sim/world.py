@@ -84,6 +84,7 @@ class World:
     def _open_db(self, path: str) -> SimConn:
         self.sched.step("open")
         assert self.sched.current is not None
+        self._notify("opened", self.sched.current)
         return SimConn(self, self.sched.current)
 
     def _on_step(self, proc: Proc, label: str) -> None:
@@ -177,7 +178,8 @@ class World:
             self._notify("server_error", proc, command.kind, exc)
 
     def _do_create(self, conn, command: Command) -> None:
-        run_id = engine.start_run(conn, command.order_id, Scenario(**command.scenario))
+        run_id = engine.start_run(conn, command.order_id, Scenario(**command.scenario),
+                                 idempotency_key=command.request_id)
         run = engine.get_run(conn, run_id)
         self._notify("request_replied", command.request_id, run_id)
         self._notify("replied", self.sched.current, "create", run.status, run_id)

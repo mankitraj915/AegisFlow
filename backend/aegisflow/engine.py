@@ -158,18 +158,42 @@ def _drive(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
             )
 
 
-def start_run(conn, order_id: str, scenario: Scenario, hook: Hook | None = None) -> str:
+def run_id_for_key(conn, idempotency_key: str) -> str | None:
+    row = conn.execute("SELECT id FROM runs WHERE idempotency_key=?", (idempotency_key,)).fetchone()
+    return row["id"] if row else None
+
+
+def start_run_once(conn, order_id: str, scenario: Scenario, idempotency_key: str | None = None,
+                   hook: Hook | None = None) -> tuple[str, bool]:
+    """Create and drive a run. Returns (run id, whether this call created it): a
+    repeated request with the same key gets the original run back as it stands,
+    without driving it. Reusing a key for a different request is a Conflict."""
     if not tools.order_exists(order_id):
         raise OrderNotFound(order_id)
     run_id = runtime.current.new_id()
+    scenario_json = _dumps(scenario.model_dump())
     with tx(conn):
+        if idempotency_key is not None:
+            existing = conn.execute(
+                "SELECT id, order_id, scenario_json FROM runs WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone()
+            if existing is not None:
+                if (existing["order_id"], existing["scenario_json"]) != (order_id, scenario_json):
+                    raise Conflict(f"idempotency key {idempotency_key} was already used for a different request")
+                return existing["id"], False
         conn.execute(
-            "INSERT INTO runs(id, order_id, scenario_json, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
-            (run_id, order_id, _dumps(scenario.model_dump()), "running", now(), now()),
+            "INSERT INTO runs(id, order_id, scenario_json, status, created_at, updated_at, idempotency_key) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (run_id, order_id, scenario_json, "running", now(), now(), idempotency_key),
         )
         _event(conn, run_id, "run_created", {"order_id": order_id, "scenario": scenario.model_dump()})
     advance(conn, run_id, hook)
-    return run_id
+    return run_id, True
+
+
+def start_run(conn, order_id: str, scenario: Scenario, hook: Hook | None = None,
+              idempotency_key: str | None = None) -> str:
+    return start_run_once(conn, order_id, scenario, idempotency_key, hook)[0]
 
 
 def advance(conn, run_id: str, hook: Hook | None = None) -> str:
