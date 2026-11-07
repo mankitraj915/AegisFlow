@@ -24,7 +24,7 @@ FAULT_RATES: dict[str, tuple[float, float]] = {
     "tool_late_delivery": (0.03, 0.2),
 }
 # Workload shapes, switched per seed like faults.
-SHAPES = ("duplicate_commands", "scenario_faults", "readers")
+SHAPES = ("duplicate_commands", "scenario_faults", "readers", "stale_operators")
 FEATURES = tuple(FAULT_RATES) + SHAPES
 
 ORDERS = ["ORD-1001", "ORD-1002", "ORD-2002", "ORD-3003", "ORD-4004", "ORD-9009"]
@@ -42,6 +42,7 @@ class Command:
     action: str = ""  # operate: resume | advance | approve | reject
     pick: float = 0.0  # operate/read: which run, as a fraction of those eligible
     duplicate: bool = False
+    stale: bool = False  # operate: acts on any run, like a client with an out-of-date page
 
 
 @dataclass
@@ -99,7 +100,8 @@ def make_plan(seed: int, only: set[str] | None = None, without: set[str] | froze
             commands.append(Command("create", at + delay, order, scenario, request_id=f"req-{i}", duplicate=True))
     for _ in range(rng.randint(0, 4)):
         action = rng.choice(["resume", "advance", "approve", "reject"])
-        commands.append(Command("operate", _when(rng), action=action, pick=rng.random()))
+        stale = rng.random() < 0.5 and "stale_operators" in enabled
+        commands.append(Command("operate", _when(rng), action=action, pick=rng.random(), stale=stale))
     readers = rng.randint(1, 2)
     if "readers" in enabled:
         for _ in range(readers):

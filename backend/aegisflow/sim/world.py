@@ -13,6 +13,7 @@ from .storage import DurableWal, SimConn, raw_connect
 from .workload import Command, Plan
 
 OPERATOR_ROUNDS = 12
+ANY_STATUS = {"running", "awaiting_approval", "succeeded", "failed", "rejected"}
 EXPECTED_ERRORS = (engine.Conflict, engine.RunNotFound, engine.OrderNotFound)
 
 
@@ -190,7 +191,9 @@ class World:
 
     def _do_operate(self, conn, command: Command) -> None:
         action = command.action
-        if action in ("approve", "reject"):
+        if command.stale:
+            run_id = self._pick_run(conn, ANY_STATUS, command.pick)
+        elif action in ("approve", "reject"):
             run_id = self._pick_run(conn, {"awaiting_approval"}, command.pick)
         else:
             run_id = self._pick_run(conn, {"running", "awaiting_approval"}, command.pick)
@@ -206,7 +209,7 @@ class World:
         self._notify("replied", self.sched.current, action, run.status, run_id)
 
     def _do_read(self, conn, command: Command) -> None:
-        run_id = self._pick_run(conn, {"running", "awaiting_approval", "succeeded", "failed", "rejected"}, command.pick)
+        run_id = self._pick_run(conn, ANY_STATUS, command.pick)
         if run_id is not None:
             engine.get_run_detail(conn, run_id)
             engine.list_events(conn, run_id)
