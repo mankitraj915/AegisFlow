@@ -59,7 +59,7 @@ class World:
 
     def runtime(self) -> runtime.Runtime:
         return runtime.Runtime(
-            clock=self.sched.now,
+            clock=self._clock,
             new_id=lambda: f"{self._ids.getrandbits(128):032x}",
             sleep=lambda seconds: self.sched.sleep_us(int(seconds * 1_000_000)),
             open_db=self._open_db,
@@ -81,6 +81,11 @@ class World:
             getattr(observer, method)(*args)
 
     # ---- seams ----
+
+    def _clock(self):
+        if self.sched.current is not None:
+            self.sched.current.clock_read_us = self.sched.true_us
+        return self.sched.now()
 
     def _open_db(self, path: str) -> SimConn:
         self.sched.step("open")

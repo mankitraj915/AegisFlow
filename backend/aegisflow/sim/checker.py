@@ -62,8 +62,7 @@ class Checker:
         self.seen: Counter = Counter()
         self._reset_snapshot()
         self.claim_count: Counter = Counter()
-        self.failed_attempts: dict[str, list[tuple[int, int, int, int]]] = defaultdict(list)
-        self.attempt_began: dict[str, int] = {}
+        self.failed_attempts: dict[str, list[tuple[int, int, int]]] = defaultdict(list)
         self.succeeded_at: dict[str, int] = {}
         self.forward_jumps: list[int] = []
         self.last_skew = 0
@@ -98,6 +97,8 @@ class Checker:
         proc.schema_current_at_open = version == db.SCHEMA_VERSION
 
     def statement(self, proc: Proc, verb: str) -> None:
+        if verb == "BEGIN":
+            proc.read_before_tx_us = proc.clock_read_us
         if proc.readonly and verb in WRITE_VERBS and proc.schema_current_at_open:
             self.fail("read_path_writes", f"{proc.name} ran {verb} on a read-only path")
 
@@ -162,19 +163,20 @@ class Checker:
                     self.succeeded_at[step_key] = now
                 elif event["type"] == "step_attempt_failed":
                     delay_us = int(payload["next_delay_s"] * 1_000_000)
-                    attempt_began = self.attempt_began.get(step_key, now)
-                    self.failed_attempts[step_key].append((attempt_began, now, delay_us, payload["attempt"]))
+                    # A backoff runs from when the engine read the clock to schedule it, just
+                    # before this transaction, however long the commit then took.
+                    read_at = proc.read_before_tx_us if proc is not None else None
+                    self.failed_attempts[step_key].append((now if read_at is None else read_at, delay_us,
+                                                           payload["attempt"]))
                     if payload["next_delay_s"] != POLICY.delay(payload["attempt"]):
                         self.fail("wrong_backoff_delay", f"attempt {payload['attempt']}: {payload['next_delay_s']}")
 
     def tool_started(self, proc: Proc, name: str, key: str) -> None:
         now = self.world.sched.true_us
-        self.attempt_began[key] = now
-        for attempt_began, failed_at, delay_us, attempt in self.failed_attempts.get(key, ()):
-            # The backoff's end is computed from the clock before the failure commits, so a
-            # jump any time since the attempt began may have shortened it. That's expected
-            # of a wall-clock backoff; a retry with no jump in that span is a real skip.
-            jumped = any(attempt_began <= t <= now for t in self.forward_jumps)
+        for failed_at, delay_us, attempt in self.failed_attempts.get(key, ()):
+            # A forward jump since then shortens a wall-clock backoff, as documented.
+            # A retry with no jump in that span is a real skip.
+            jumped = any(failed_at <= t <= now for t in self.forward_jumps)
             if now - failed_at < delay_us and not jumped:
                 self.fail("backoff_skipped", f"{name}: retried {now - failed_at} us after attempt {attempt}, "
                           f"wanted {delay_us} us")

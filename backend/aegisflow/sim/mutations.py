@@ -139,10 +139,10 @@ MUTATIONS = {m.name: m for m in (
 # Not engine bugs: checker mistakes the simulator exposed. Each puts the mistake back,
 # so a regression test can show that its seed really did report a false failure.
 CHECKER_MISTAKES = {m.name: m for m in (
-    Mutation("jump_window_from_commit", "the backoff's clock-jump exemption begins only when the failure commits",
+    Mutation("backoff_timed_from_commit", "a backoff is timed from when the failure commits, not the clock read",
              ("backoff_skipped",),
-             (("aegisflow.sim.checker", "jumped = any(attempt_began <= t <= now for t in self.forward_jumps)",
-               "jumped = any(failed_at <= t <= now for t in self.forward_jumps)"),)),
+             (("aegisflow.sim.checker", "read_at = proc.read_before_tx_us if proc is not None else None",
+               "read_at = None"),)),
     Mutation("schema_judged_per_statement", "read-path writes are judged by the schema version at each statement",
              ("read_path_writes",),
              (("aegisflow.sim.checker", "if proc.readonly and verb in WRITE_VERBS and proc.schema_current_at_open:",

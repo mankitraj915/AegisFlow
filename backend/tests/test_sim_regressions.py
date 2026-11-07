@@ -45,6 +45,14 @@ def test_discovery_seeds_stay_clean(seed):
     assert simulate(seed).failures() == []
 
 
+# Checker mistakes the simulator exposed: (mistake, seed that reported a false failure).
+@pytest.mark.parametrize("mistake,seed", [("backoff_timed_from_commit", 4538), ("schema_judged_per_statement", 121)])
+def test_seed_that_exposed_a_checker_mistake_stays_clean(mistake, seed):
+    assert simulate(seed).failures() == []
+    with applied(mistake):
+        assert set(CHECKER_MISTAKES[mistake].catches) & simulate(seed).invariants()
+
+
 def test_a_range_of_seeds_is_clean():
     for seed in range(100):
         assert simulate(seed).failures() == [], f"python -m aegisflow.sim replay --seed {seed}"
