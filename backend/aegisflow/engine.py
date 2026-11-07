@@ -59,10 +59,6 @@ RETRY_POLICY = RetryPolicy()
 LEASE_S = 60
 
 
-def _sleep(seconds: float) -> None:  # Test seam: replaced so tests never really wait.
-    runtime.current.sleep(seconds)
-
-
 class RunNotFound(Exception):
     pass
 
@@ -229,7 +225,7 @@ def _advance(conn, run_id: str, hook: Hook | None) -> str:
                         })
                 if hook:
                     hook("retry_scheduled", name)
-                _sleep(delay)  # Outside tx(): never hold the write lock while waiting.
+                runtime.current.sleep(delay)  # Outside tx(): never hold the write lock while waiting.
                 continue
             info = {"attempt": attempt, "retryable": True, "exhausted": True}
             if name in tools.SIDE_EFFECTING:
