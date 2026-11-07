@@ -1,11 +1,14 @@
+import logging
 import os
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import engine, tools
+from . import engine, recovery, tools
 from .db import connect
 from .models import AvailableOrder, CreateRun, Decision, EventOut, Resolution, RunDetail, RunOut
 
@@ -13,12 +16,55 @@ from .models import AvailableOrder, CreateRun, Decision, EventOut, Resolution, R
 DEFAULT_FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 
+logger = logging.getLogger("aegisflow.recovery")
+DEFAULT_RECOVERY_INTERVAL_S = 30.0
+
+
+def _database(db_path: str | None) -> str:
+    return db_path or os.environ.get("AEGISFLOW_DB", "aegisflow.db")
+
+
+def _recovery_loop(path: str, stop: threading.Event, interval_s: float) -> None:
+    while not stop.wait(interval_s):
+        try:
+            conn = connect(path)
+            try:
+                result = recovery.sweep(conn)
+            finally:
+                conn.close()
+            for run_id, exc in result.errors:
+                logger.error("recovering run %s failed: %r", run_id, exc)
+        except Exception:
+            logger.exception("recovery sweep failed")  # The next sweep starts afresh.
+
+
+def _recovering(path: str):
+    """Lifespan that sweeps for abandoned runs in the background while the server is
+    up. AEGISFLOW_RECOVERY_INTERVAL_S sets how often; 0 turns it off."""
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        interval_s = float(os.environ.get("AEGISFLOW_RECOVERY_INTERVAL_S", DEFAULT_RECOVERY_INTERVAL_S))
+        stop = threading.Event()
+        worker = None
+        if interval_s > 0:
+            worker = threading.Thread(target=_recovery_loop, args=(path, stop, interval_s), daemon=True)
+            worker.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            if worker is not None:
+                worker.join(5)
+
+    return lifespan
+
+
 def create_app(db_path: str | None = None, max_runs: int | None = None) -> FastAPI:
-    path = db_path or os.environ.get("AEGISFLOW_DB", "aegisflow.db")
+    path = _database(db_path)
     if max_runs is None and os.environ.get("AEGISFLOW_MAX_RUNS"):
         max_runs = int(os.environ["AEGISFLOW_MAX_RUNS"])
     connect(path).close()  # create schema up front
-    app = FastAPI(title="AegisFlow")
+    app = FastAPI(title="AegisFlow", lifespan=_recovering(path))
 
     def get_conn():
         conn = connect(path)
@@ -108,7 +154,9 @@ def create_site(db_path: str | None = None, frontend_dist: str | None = None) ->
     dist = Path(frontend_dist or os.environ.get("AEGISFLOW_FRONTEND_DIST") or DEFAULT_FRONTEND_DIST)
     if not (dist / "index.html").is_file():
         raise RuntimeError(f"frontend build not found at {dist}; run `npm run build` in frontend/")
-    site = FastAPI(title="AegisFlow", docs_url=None, redoc_url=None, openapi_url=None)
+    # A mounted app's lifespan doesn't run, so the site is the one that sweeps.
+    site = FastAPI(title="AegisFlow", docs_url=None, redoc_url=None, openapi_url=None,
+                   lifespan=_recovering(_database(db_path)))
     site.mount("/api", create_app(db_path))
     site.mount("/", StaticFiles(directory=dist, html=True))
     return site

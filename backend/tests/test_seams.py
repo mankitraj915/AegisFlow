@@ -9,7 +9,7 @@ import pytest
 import aegisflow
 
 PACKAGE = Path(aegisflow.__file__).parent
-ENGINE_CODE = ["engine.py", "planner.py", "tools.py", "db.py", "models.py", "demo_data.py"]
+ENGINE_CODE = ["engine.py", "recovery.py", "planner.py", "tools.py", "db.py", "models.py", "demo_data.py"]
 
 BANNED_MODULES = {
     "asyncio", "http", "multiprocessing", "os", "pathlib", "random", "requests", "secrets", "shutil",

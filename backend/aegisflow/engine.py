@@ -236,6 +236,39 @@ def resume(conn, run_id: str, hook: Hook | None = None) -> str:
     return _drive(conn, run_id, epoch, hook)
 
 
+def recover(conn, run_id: str, hook: Hook | None = None) -> str:
+    """Continue a run its driver abandoned. It takes the lease like any other
+    driver, so an expired one left running is fenced off. See recovery.sweep."""
+    with tx(conn):
+        run = _read_run(conn, run_id)
+        if run["status"] != "running" or run["interrupted"]:
+            raise Conflict(f"run {run_id} is not waiting to be recovered")
+        epoch = _claim(conn, run_id)
+        pending = conn.execute(
+            "SELECT idx, name, idempotency_key FROM steps WHERE run_id=? AND status='started'", (run_id,)
+        ).fetchone()
+        _event(conn, run_id, "run_recovered", dict(pending) if pending else {})
+    return _drive(conn, run_id, epoch, hook)
+
+
+def abandoned_runs(conn) -> list[str]:
+    """Running runs nobody is driving: their lease has expired, or none was taken
+    and nothing has happened for a lease's length, which leaves a client that has
+    only just created its run alone. An interrupted run is waiting for a person."""
+    at = now()
+    quiet_since = (datetime.fromisoformat(at) - timedelta(seconds=LEASE_S)).isoformat()
+    return [r["id"] for r in conn.execute(
+        "SELECT id FROM (" + _RUNS_READ + ") AS r WHERE status='running' AND interrupted IS NOT 1 AND ("
+        "lease_expires_at < ? OR (lease_token IS NULL AND "
+        "(SELECT ts FROM events WHERE run_id=r.id ORDER BY seq DESC LIMIT 1) < ?)) ORDER BY created_at, id",
+        (at, quiet_since),
+    )]
+
+
+def held_runs(conn) -> list[str]:
+    return [r["id"] for r in conn.execute("SELECT id FROM runs WHERE status='needs_review' ORDER BY created_at, id")]
+
+
 def _wait_for_backoff(next_attempt_at: str | None) -> None:
     """Whoever picks up a step mid-backoff waits out what's left of it. Capped
     because the clock may have jumped back since the delay was scheduled."""
