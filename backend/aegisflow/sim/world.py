@@ -40,7 +40,7 @@ class World:
         # Survives anything that happens to engine storage, like a real payment system.
         conn = sqlite3.connect(":memory:", isolation_level=None, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.executescript(db.SCHEMA)
+        db.ensure_schema(conn)
         return conn
 
     def runtime(self) -> runtime.Runtime:
@@ -225,7 +225,7 @@ class World:
         finish up. Whatever's still unfinished after that is stuck for good."""
         self.sched.run_until_idle()
         self.faults_on = False
-        self.keeper.executescript(db.SCHEMA)  # A crash may have beaten every connect() to it.
+        db.ensure_schema(self.keeper)  # A crash may have beaten every connect() to it.
         for number in range(OPERATOR_ROUNDS):
             if not self.unfinished():
                 return

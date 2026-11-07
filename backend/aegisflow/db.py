@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from . import runtime
 
 SYNCHRONOUS = "FULL"
+SCHEMA_VERSION = 1  # Raise whenever _migrate gains a step.
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -82,9 +83,16 @@ def connect(path: str) -> sqlite3.Connection:
     # Sync the WAL on every commit, so a commit survives power loss. SQLite's
     # usual default, stated here because the durability claims depend on it.
     conn.execute(f"PRAGMA synchronous={SYNCHRONOUS}")
-    conn.executescript(SCHEMA)
-    _migrate(conn)
+    ensure_schema(conn)
     return conn
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create or upgrade the schema. Skipped once current, so an ordinary
+    connection, including every read, never needs the write lock."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -97,6 +105,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for col in ("lease_token", "lease_expires_at"):
             if col not in run_cols:
                 conn.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
 @contextmanager
