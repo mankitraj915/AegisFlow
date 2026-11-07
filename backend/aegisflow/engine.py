@@ -27,6 +27,12 @@ request may still be in flight. Whatever the lookup can't settle puts the run in
 'needs_review', which no driver leaves on its own: a later lookup that finds the
 effect (reconcile()) or a person (resolve()) has to settle it.
 
+Crash loops: a step is marked as executing while a driver works on it. Finding it
+still marked means the last driver stopped with no outcome, for whatever reason,
+and that counts as a crash of that step. A step that keeps killing whoever runs
+it would otherwise be resumed forever, so after MAX_CRASHES the run is quarantined:
+it stops for good with its history intact, and nothing resumes it.
+
 Concurrency: every advance() first takes the run's lease in a write transaction,
 so normally one advance() drives a run at a time and another caller gets
 Conflict. The lease is released when advance() returns or raises, and one left
@@ -78,6 +84,7 @@ RETRY_POLICY = RetryPolicy()
 LEASE_S = 60
 # How long a provider's "no record" can be believed. Must stay below its key retention.
 KEY_TRUST_S = 300
+MAX_CRASHES = 3
 
 
 class RunNotFound(Exception):
@@ -289,7 +296,7 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
         state = _load_state(conn, run)
 
         pending = conn.execute(
-            "SELECT idx, name, idempotency_key, attempt, next_attempt_at FROM steps "
+            "SELECT idx, name, idempotency_key, attempt, next_attempt_at, executing, crashes FROM steps "
             "WHERE run_id=? AND status='started'",
             (run_id,),
         ).fetchone()
@@ -298,6 +305,8 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
             attempt = pending["attempt"]
             if pending["next_attempt_at"] != waited_for:
                 _wait_for_backoff(pending["next_attempt_at"])
+            if _note_execution(conn, run_id, epoch, idx, name, key, pending):
+                return "quarantined"
             if name in tools.SIDE_EFFECTING:
                 view = _ask_provider(conn, run_id, idx, name, key, state)
                 if view.output is not None:
@@ -322,7 +331,7 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
             with _fenced_tx(conn, run_id, epoch):
                 conn.execute(
                     "INSERT INTO steps(run_id, idx, name, status, input_json, attempt, idempotency_key, "
-                    "started_at) VALUES (?,?,?,?,?,?,?,?)",
+                    "started_at, executing) VALUES (?,?,?,?,?,?,?,?,1)",
                     (run_id, idx, name, "started", _dumps(state), attempt, key, now()),
                 )
                 _event(conn, run_id, "step_started", {"idx": idx, "name": name})
@@ -335,7 +344,8 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
                 waited_for = (datetime.fromisoformat(now()) + timedelta(seconds=delay)).isoformat()
                 with _fenced_tx(conn, run_id, epoch):
                     conn.execute(
-                        "UPDATE steps SET attempt=attempt+1, error=?, next_attempt_at=? WHERE run_id=? AND idx=?",
+                        "UPDATE steps SET attempt=attempt+1, error=?, next_attempt_at=?, executing=0 "
+                        "WHERE run_id=? AND idx=?",
                         (str(exc), waited_for, run_id, idx),
                     )
                     _event(conn, run_id, "step_attempt_failed", {
@@ -369,6 +379,7 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
             hook("after_tool", name)
         if _interrupt_planned(conn, run_id, idx, name, attempt, state):
             with _fenced_tx(conn, run_id, epoch):
+                conn.execute("UPDATE steps SET executing=0 WHERE run_id=? AND idx=?", (run_id, idx))
                 _event(conn, run_id, "run_interrupted", {
                     "idx": idx, "name": name, "attempt": attempt, "idempotency_key": key, "simulated": True,
                 })
@@ -376,6 +387,27 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
 
         with _fenced_tx(conn, run_id, epoch):
             _write_success(conn, run_id, idx, name, attempt, output, state)
+
+
+def _note_execution(conn, run_id: str, epoch: int, idx: int, name: str, key: str, pending) -> bool:
+    """A driver is about to work on a step it didn't just start. Returns True if the
+    step has crashed too often for that, in which case the run is now quarantined."""
+    crashes = pending["crashes"] + pending["executing"]
+    with _fenced_tx(conn, run_id, epoch):
+        if pending["executing"]:
+            _event(conn, run_id, "step_crashed", {"idx": idx, "name": name, "crashes": crashes})
+        if crashes >= MAX_CRASHES:
+            info = {"idx": idx, "name": name, "crashes": crashes, "idempotency_key": key}
+            if name in tools.SIDE_EFFECTING:
+                info["outcome_unknown"] = True
+            error = f"{name} crashed {crashes} times with no outcome"
+            conn.execute("UPDATE steps SET executing=0, crashes=?, error=? WHERE run_id=? AND idx=?",
+                         (crashes, error, run_id, idx))
+            _set_status(conn, run_id, "quarantined", error)
+            _event(conn, run_id, "run_quarantined", _with_committed_effects(conn, run_id, info))
+            return True
+        conn.execute("UPDATE steps SET executing=1, crashes=? WHERE run_id=? AND idx=?", (crashes, run_id, idx))
+    return False
 
 
 def _write_success(conn, run_id: str, idx: int, name: str, attempt: int, output: dict, state: dict) -> None:
@@ -449,13 +481,7 @@ def _fail(conn, run_id: str, epoch: int, idx: int, name: str, error: str, info: 
     """Terminal step failure: fails the step and the run; no later step runs.
     Failing doesn't undo earlier steps, so name any effects that already happened."""
     with _fenced_tx(conn, run_id, epoch):
-        committed = [
-            r["idempotency_key"] for r in conn.execute(
-                "SELECT name, idempotency_key FROM steps WHERE run_id=? AND status='succeeded' ORDER BY idx", (run_id,)
-            ) if r["name"] in tools.SIDE_EFFECTING
-        ]
-        if committed:
-            info = {**info, "effects_committed": committed}
+        info = _with_committed_effects(conn, run_id, info)
         conn.execute(
             "UPDATE steps SET status='failed', error=?, finished_at=? WHERE run_id=? AND idx=?",
             (error, now(), run_id, idx),
@@ -464,6 +490,17 @@ def _fail(conn, run_id: str, epoch: int, idx: int, name: str, error: str, info: 
         _event(conn, run_id, "step_failed", {"idx": idx, "name": name, "error": error, **info})
         _event(conn, run_id, "run_failed", {"error": error, **info})
     return "failed"
+
+
+def _with_committed_effects(conn, run_id: str, info: dict) -> dict:
+    committed = [
+        r["idempotency_key"] for r in conn.execute(
+            "SELECT name, idempotency_key FROM steps WHERE run_id=? AND status='succeeded' ORDER BY idx", (run_id,)
+        ) if r["name"] in tools.SIDE_EFFECTING
+    ]
+    if committed:
+        return {**info, "effects_committed": committed}
+    return info
 
 
 def _interrupt_planned(conn, run_id: str, idx: int, name: str, attempt: int, state: dict) -> bool:
@@ -642,7 +679,8 @@ def get_run_detail(conn, run_id: str) -> RunDetail:
         StepOut(
             idx=r["idx"], name=r["name"], status=r["status"], input=json.loads(r["input_json"]),
             output=json.loads(r["output_json"]) if r["output_json"] else None, error=r["error"],
-            attempt=r["attempt"], idempotency_key=r["idempotency_key"], started_at=r["started_at"],
+            attempt=r["attempt"], crashes=r["crashes"], idempotency_key=r["idempotency_key"],
+            started_at=r["started_at"],
             finished_at=r["finished_at"],
         )
         for r in conn.execute("SELECT * FROM steps WHERE run_id=? ORDER BY idx", (run_id,))

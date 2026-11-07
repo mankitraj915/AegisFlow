@@ -1,4 +1,5 @@
-"""Abandoned runs get picked up without anyone asking."""
+"""Abandoned runs get picked up without anyone asking, and a step that keeps killing
+its driver can't make that go on forever."""
 import subprocess
 import sys
 import threading
@@ -160,6 +161,80 @@ def test_one_bad_run_does_not_stop_a_sweep(conn, monkeypatch):
 
     assert result.recovered == {good: "succeeded"}
     assert [run_id for run_id, _ in result.errors] == [bad]
+
+
+# ---- the crash-loop bound ----
+
+
+def test_a_step_that_keeps_crashing_is_quarantined_with_its_history(conn, monkeypatch):
+    crash = crash_at("after_tool", "notify_customer")
+    run_id = abandon(conn, at=("after_tool", "notify_customer"))
+    for _ in range(engine.MAX_CRASHES - 1):
+        conn.execute("UPDATE runs SET lease_token=NULL")
+        # The refund is settled; the message step is what keeps killing its driver.
+        monkeypatch.setattr(tools.SqlLedger, "message_status", lambda self, key: None)
+        with pytest.raises(RuntimeError):
+            engine.resume(conn, run_id, hook=crash)
+    conn.execute("UPDATE runs SET lease_token=NULL")
+
+    assert engine.resume(conn, run_id, hook=crash) == "quarantined"
+
+    run = engine.get_run(conn, run_id)
+    assert run.status == "quarantined" and "crashed 3 times" in run.error
+    history = engine.list_events(conn, run_id)
+    assert [e.payload["crashes"] for e in history if e.type == "step_crashed"] == [1, 2, 3]
+    ending = history[-1]
+    assert ending.type == "run_quarantined"
+    assert ending.payload["outcome_unknown"] is True  # notify_customer has an effect.
+    assert ending.payload["effects_committed"] == [f"{run_id}:4"]  # And the refund did happen.
+    assert engine.get_run_detail(conn, run_id).steps[5].crashes == 3
+
+
+def test_quarantine_is_final(conn, monkeypatch):
+    run_id = abandon(conn, at=("after_tool", "fetch_order"))
+    conn.execute("UPDATE steps SET crashes=?", (engine.MAX_CRASHES,))
+    later(monkeypatch, engine.LEASE_S + 1)
+
+    assert recovery.sweep(conn).recovered == {run_id: "quarantined"}
+    history = types(conn, run_id)
+    later(monkeypatch, 10 * engine.LEASE_S)
+
+    assert recovery.sweep(conn).recovered == {}
+    assert engine.advance(conn, run_id) == "quarantined"
+    with pytest.raises(engine.Conflict):
+        engine.resume(conn, run_id)
+    with pytest.raises(engine.Conflict):
+        engine.reconcile(conn, run_id)
+    assert types(conn, run_id) == history
+    assert refunds(conn) == []
+
+
+def test_a_step_with_no_effect_is_not_called_unknown(conn):
+    run_id = abandon(conn, at=("after_tool", "fetch_order"))
+    conn.execute("UPDATE steps SET crashes=?", (engine.MAX_CRASHES,))
+    conn.execute("UPDATE runs SET lease_token=NULL")
+
+    assert engine.resume(conn, run_id) == "quarantined"
+    payload = engine.list_events(conn, run_id)[-1].payload
+    assert "outcome_unknown" not in payload and "effects_committed" not in payload
+
+
+def test_retries_and_interruptions_are_not_crashes(conn):
+    scenario = Scenario(faults={"fetch_order": ["retryable", "retryable"], "issue_refund": ["interrupt_after_commit"]})
+    run_id = engine.start_run(conn, "ORD-1001", scenario)
+    assert engine.resume(conn, run_id) == "succeeded"
+
+    assert "step_crashed" not in types(conn, run_id)
+    assert {s.crashes for s in engine.get_run_detail(conn, run_id).steps} == {0}
+
+
+def test_a_crash_count_stays_with_its_own_step(conn):
+    run_id = abandon(conn, at=("after_tool", "fetch_order"))
+    conn.execute("UPDATE runs SET lease_token=NULL")
+    assert engine.resume(conn, run_id) == "succeeded"
+
+    crashes = [s.crashes for s in engine.get_run_detail(conn, run_id).steps]
+    assert crashes == [1, 0, 0, 0, 0, 0]
 
 
 # ---- real processes ----

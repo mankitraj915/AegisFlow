@@ -13,9 +13,10 @@ from .storage import WRITE_VERBS
 
 MAX_ATTEMPTS = engine.RETRY_POLICY.max_attempts
 POLICY = engine.RetryPolicy()
-TERMINAL = {"succeeded", "failed", "rejected"}
+TERMINAL = {"succeeded", "failed", "rejected", "quarantined"}
+LEASE_US = engine.LEASE_S * 1_000_000
 LEGAL_RUN_MOVES = {
-    "running": {"awaiting_approval", "needs_review", "succeeded", "failed"},
+    "running": {"awaiting_approval", "needs_review", "succeeded", "failed", "quarantined"},
     "awaiting_approval": {"running", "rejected"},
     "needs_review": {"running", "failed"},
 }
@@ -46,6 +47,8 @@ INVARIANTS = (
     "double_decision",
     "unknown_reported_as_failure",
     "ledger_mismatch",
+    "two_drivers",
+    "crash_loop_unbounded",
     "undisclosed_effect_before_failure",
     "request_ran_twice",
     "read_path_writes",
@@ -70,6 +73,7 @@ class Checker:
         self.last_skew = 0
         self.acks: dict[str, str] = {}
         self.requests: dict[str, set[str]] = defaultdict(set)
+        self.lease_read_at: dict[tuple[str, str], int] = {}  # (run, token) -> when it was taken
 
     def _reset_snapshot(self) -> None:
         self.runs: dict[str, dict] = {}
@@ -123,6 +127,7 @@ class Checker:
             old = self.runs.get(run_id)
             if run["lease_token"] and (old is None or old["lease_token"] != run["lease_token"]):
                 self.claim_count[run_id] += 1
+                self._check_takeover(run_id, old, run["lease_token"], proc)
                 if proc is not None:
                     proc.claims[run_id] = self.claim_count[run_id]
             if old is not None and old["status"] != run["status"]:
@@ -173,6 +178,24 @@ class Checker:
                     if payload["next_delay_s"] != POLICY.delay(payload["attempt"]):
                         self.fail("wrong_backoff_delay", f"attempt {payload['attempt']}: {payload['next_delay_s']}")
 
+    def _check_takeover(self, run_id: str, old: dict | None, token: str, proc: Proc | None) -> None:
+        """A lease may only be taken from a holder that let it go or whose time is up.
+        Both clock reads came before their transactions, which is what the engine compared."""
+        now = self.world.sched.true_us
+        if proc is None:  # Restored from disk after a power loss: this lease was taken back then.
+            self.lease_read_at.setdefault((run_id, token), now)
+            return
+        read_at = proc.read_before_tx_us if proc.read_before_tx_us is not None else now
+        self.lease_read_at[(run_id, token)] = read_at
+        if old is None or not old["lease_token"]:
+            return
+        held_since = self.lease_read_at[(run_id, old["lease_token"])]
+        # A forward clock jump can really expire a lease early, as documented.
+        jumped = any(held_since <= t <= now for t in self.forward_jumps)
+        if read_at - held_since < LEASE_US and not jumped:
+            self.fail("two_drivers", f"{run_id[:8]} claimed {(read_at - held_since) // 1000} ms after a driver "
+                      "that still held it")
+
     def tool_started(self, proc: Proc, name: str, key: str) -> None:
         now = self.world.sched.true_us
         for failed_at, delay_us, attempt in self.failed_attempts.get(key, ()):
@@ -214,6 +237,10 @@ class Checker:
         for key, count in world.deliveries.items():
             if count > 1:
                 self.fail("notified_twice", f"{key} delivered {count} times")
+        for key, count in world.poison_kills.items():
+            # The bound, plus drivers already mid-step when a takeover made them stale.
+            if count > engine.MAX_CRASHES + 2:
+                self.fail("crash_loop_unbounded", f"{key} killed its driver {count} times")
 
         keeper = world.keeper
         runs = {r["id"]: dict(r) for r in keeper.execute("SELECT * FROM runs")}
@@ -278,20 +305,24 @@ class Checker:
             if planner.approval_reason("issue_refund", state):
                 self.fail("gate_bypassed", f"{short} refunded with no approval")
 
-        if run["status"] == "failed":
-            failure: dict = next((p for _, t, p in events if t == "run_failed"), {})
-            failed_step = next((s for s in steps.values() if s["status"] == "failed"), None)
+        if run["status"] in ("failed", "quarantined"):
+            quarantined = run["status"] == "quarantined"
+            ending = "run_quarantined" if quarantined else "run_failed"
+            failure: dict = next((p for _, t, p in events if t == ending), {})
+            stuck_as = "started" if quarantined else "failed"
+            failed_step = next((s for s in steps.values() if s["status"] == stuck_as), None)
             failed_name = failed_step["name"] if failed_step else None
             failed_key = failed_step["idempotency_key"] if failed_step else ""
-            if failed_name in tools.SIDE_EFFECTING and self.world.ledger.truly_has(failed_key):
-                self.fail("unknown_reported_as_failure", f"{short} reported {failed_name} as failed "
+            says_unknown = quarantined and failure.get("outcome_unknown")
+            if failed_name in tools.SIDE_EFFECTING and self.world.ledger.truly_has(failed_key) and not says_unknown:
+                self.fail("unknown_reported_as_failure", f"{short} reported {failed_name} as {run['status']} "
                           "and the provider did it")
             if refunds and failed_name != "issue_refund" and not failure.get("effects_committed"):
                 self.fail("undisclosed_effect_before_failure", f"{short} failed after its refund committed "
                           "without saying so")
 
         # While a run is held for review the books are allowed to be unsettled, and say so.
-        if run["status"] != "needs_review":
+        if run["status"] not in ("needs_review", "quarantined"):
             recorded = sum(json.loads(s["output_json"])["amount_paise"] for s in steps.values()
                            if s["name"] == "issue_refund" and s["status"] == "succeeded")
             actual = sum(r["amount_paise"] for r in refunds)
@@ -320,6 +351,8 @@ class Checker:
                 status, terminal_events = "succeeded", terminal_events + 1
             elif type_ == "run_failed":
                 status, terminal_events = "failed", terminal_events + 1
+            elif type_ == "run_quarantined":
+                status, terminal_events = "quarantined", terminal_events + 1
             elif type_ == "step_started":
                 rebuilt[idx] = {"status": "started", "attempt": 1, "output": None}
             elif type_ == "step_attempt_failed" and idx in rebuilt:

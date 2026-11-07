@@ -13,10 +13,10 @@ from aegisflow.sim.run import simulate
 # (control, seed, invariant it breaks)
 ENGINE_BUGS = [
     ("lose_outcome_unknown", 439, "unknown_reported_as_failure"),  # P1
-    ("no_fencing", 268, "history_mismatch"),  # P2
-    ("no_order_cap", 8, "refund_cap"),  # P3
-    ("ignore_request_key", 14, "request_ran_twice"),  # P3
-    ("volatile_backoff", 2989, "backoff_skipped"),  # P4
+    ("no_fencing", 713, "history_mismatch"),  # P2
+    ("no_order_cap", 76, "refund_cap"),  # P3
+    ("ignore_request_key", 1, "request_ran_twice"),  # P3
+    ("volatile_backoff", 2568, "backoff_skipped"),  # P4
     ("write_on_connect", 2, "read_path_writes"),  # P5
     ("notify_ignores_key", 19, "notified_twice"),  # P6
     ("hide_committed_effects", 28, "undisclosed_effect_before_failure"),  # P7
@@ -25,9 +25,9 @@ ENGINE_BUGS = [
 # The bug classes the design has to rule out.
 CLASSES = [
     ("skip_idempotency_check", 5, "ledger_mismatch"),
-    ("skip_idempotency_check_and_cap", 8, "refund_cap"),
-    ("record_progress_first", 8, "succeeded_without_effect"),
-    ("drop_fsync", 12, "ack_lost"),
+    ("skip_idempotency_check_and_cap", 45, "refund_cap"),
+    ("record_progress_first", 58, "succeeded_without_effect"),
+    ("drop_fsync", 43, "ack_lost"),
 ]
 
 
@@ -46,7 +46,8 @@ def test_discovery_seeds_stay_clean(seed):
 
 
 # Checker mistakes the simulator exposed: (mistake, seed that reported a false failure).
-@pytest.mark.parametrize("mistake,seed", [("backoff_timed_from_commit", 4538), ("schema_judged_per_statement", 121)])
+@pytest.mark.parametrize("mistake,seed", [("backoff_timed_from_commit", 2568), ("schema_judged_per_statement", 34),
+                                                  ("lease_timed_from_restart", 474)])
 def test_seed_that_exposed_a_checker_mistake_stays_clean(mistake, seed):
     assert simulate(seed).failures() == []
     with applied(mistake):

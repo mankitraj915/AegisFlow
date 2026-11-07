@@ -285,7 +285,7 @@ def test_resume_after_real_process_death(db_path, monkeypatch):
     assert [(e.type, e.payload.get("idx")) for e in history] == [("run_created", None)] + [
         (t, i) for i in range(4) for t in ("step_started", "step_succeeded")
     ] + [
-        ("step_started", 4), ("run_resumed", 4), ("step_reconciled", 4), ("step_succeeded", 4),
+        ("step_started", 4), ("run_resumed", 4), ("step_crashed", 4), ("step_reconciled", 4), ("step_succeeded", 4),
         ("step_started", 5), ("step_succeeded", 5), ("run_succeeded", None),
     ]
     assert history[10].type == "run_resumed" and history[10].payload["idempotency_key"] == key

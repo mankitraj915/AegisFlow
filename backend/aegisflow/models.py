@@ -69,6 +69,7 @@ class StepOut(BaseModel):
     output: dict | None
     error: str | None
     attempt: int
+    crashes: int  # Drivers that stopped mid-step with no outcome recorded.
     idempotency_key: str
     started_at: str
     finished_at: str | None

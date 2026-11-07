@@ -6,14 +6,14 @@ import sqlite3
 from collections import Counter
 from functools import partial
 
-from .. import db, engine, runtime, tools
+from .. import db, engine, recovery, runtime, tools
 from ..models import Scenario
 from .scheduler import Killed, Proc, Scheduler
 from .storage import DurableWal, SimConn, raw_connect
 from .workload import Command, Plan
 
 OPERATOR_ROUNDS = 12
-ANY_STATUS = {"running", "awaiting_approval", "needs_review", "succeeded", "failed", "rejected"}
+ANY_STATUS = {"running", "awaiting_approval", "needs_review", "succeeded", "failed", "rejected", "quarantined"}
 EXPECTED_ERRORS = (engine.Conflict, engine.RunNotFound, engine.OrderNotFound)
 
 
@@ -83,6 +83,7 @@ class World:
         retention = plan.retention_us if "provider_forgets" in plan.enabled else None
         self.ledger = _Provider(self.external, self.deliveries, lambda: self.sched.true_us, retention)
         self.failed_keys: set[str] = set()
+        self.poison_kills: Counter = Counter()
 
     @staticmethod
     def _open_external() -> sqlite3.Connection:
@@ -168,6 +169,12 @@ class World:
         proc = sched.current
         self._notify("tool_started", proc, name, key)
         sched.step(f"tool {name}")
+        if self._is_poison(name, key):
+            self.poison_kills[key] += 1
+            self.sched.log(f"poison {name}")
+            assert proc is not None
+            proc.killed = True
+            raise Killed
         if self.on("tool_stall"):
             sched.sleep_us(self._values.randrange(61_000_000, 130_000_000))  # Beyond the lease.
         elif self.on("tool_delay"):
@@ -202,6 +209,13 @@ class World:
         if self.on("tool_drop_response"):
             raise tools.RetryableToolError("simulated: response lost")
         return output
+
+    def _is_poison(self, name: str, key: str) -> bool:
+        """Faults stop for good in the settling phase. This one doesn't: it's a bug in the step."""
+        if self.plan.poison is None or name != self.plan.poison[1]:
+            return False
+        run = self.keeper.execute("SELECT order_id FROM runs WHERE id=?", (key.split(":")[0],)).fetchone()
+        return run is not None and run["order_id"] == self.plan.poison[0]
 
     def _lookup(self, name: str, key: str, call) -> dict | None:
         self.sched.step(f"status {name}")
@@ -275,6 +289,12 @@ class World:
         run = engine.get_run(conn, run_id)
         self._notify("replied", self.sched.current, action, run.status, run_id)
 
+    def _do_sweep(self, conn, command: Command | None = None) -> None:
+        result = recovery.sweep(conn)
+        for _, exc in result.errors:
+            if not isinstance(exc, sqlite3.Error):  # Storage faults are injected. Anything else is a bug.
+                raise exc
+
     def _do_read(self, conn, command: Command) -> None:
         run_id = self._pick_run(conn, ANY_STATUS, command.pick)
         if run_id is not None:
@@ -287,7 +307,9 @@ class World:
         for run in engine.list_runs(conn):
             try:
                 if run.status == "running":
-                    engine.resume(conn, run.id)
+                    # With a worker in this world, abandoned runs are its job, and it has to manage alone.
+                    if run.interrupted or "recovery_worker" not in self.plan.enabled:
+                        engine.resume(conn, run.id)
                 elif run.status == "awaiting_approval":
                     if self._values.random() < 0.7:
                         engine.approve(conn, run.id, "operator")
@@ -297,6 +319,10 @@ class World:
                     self._settle_by_hand(conn, run.id)
             except engine.Conflict:
                 pass
+
+    def _worker_pass(self) -> None:
+        conn = db.connect(self.path)
+        self._do_sweep(conn)
 
     def _settle_by_hand(self, conn, run_id: str) -> None:
         """A person checks the provider's records, once nothing is in flight any more."""
@@ -322,6 +348,8 @@ class World:
             if not self.unfinished():
                 return
             self.sched.true_us += (engine.LEASE_S + 1) * 1_000_000  # Abandoned leases expire.
+            if "recovery_worker" in self.plan.enabled:
+                self.sched.spawn(f"worker-{number}", self._worker_pass)
             self.sched.spawn(f"operator-{number}", self._operator_pass)
             self.sched.run_until_idle()
 

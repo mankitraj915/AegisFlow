@@ -29,9 +29,11 @@ FAULT_RATES: dict[str, tuple[float, float]] = {
     "status_unavailable": (0.03, 0.3),
 }
 # Workload shapes, switched per seed like faults.
-SHAPES = ("duplicate_commands", "scenario_faults", "readers", "stale_operators", "provider_forgets")
+SHAPES = ("duplicate_commands", "scenario_faults", "readers", "stale_operators", "provider_forgets",
+          "recovery_worker", "poison_step")
 # Newer features draw from a stream of their own, so adding one leaves each seed's other draws alone.
-SIDE_FEATURES = ("provider_false_error", "provider_stale_response", "status_unavailable", "provider_forgets")
+SIDE_FEATURES = ("provider_false_error", "provider_stale_response", "status_unavailable", "provider_forgets",
+                 "recovery_worker", "poison_step")
 FEATURES = tuple(f for f in (*FAULT_RATES, *SHAPES) if f not in SIDE_FEATURES)
 # How long a forgetful provider remembers a key, and how long an outage can age a run.
 RETENTION_S = (310, 700)
@@ -44,7 +46,7 @@ LOW_VALUE_ORDER_WEIGHT = 4
 
 @dataclass
 class Command:
-    kind: str  # create | operate | read
+    kind: str  # create | operate | read | sweep
     at_us: int
     order_id: str = ""
     scenario: dict = field(default_factory=dict)
@@ -63,6 +65,7 @@ class Plan:
     commands: list[Command]
     retention_us: int = 0
     outage_us: int = 0
+    poison: tuple[str, str] | None = None  # (order, step) that kills whoever runs it, every time.
 
 
 def _when(rng: random.Random) -> int:
@@ -125,4 +128,11 @@ def make_plan(seed: int, only: set[str] | None = None, without: set[str] | froze
     if "readers" in enabled:
         for _ in range(readers):
             commands.append(Command("read", _when(rng), pick=rng.random()))
-    return Plan(enabled, rates, stickiness, commands, retention_us, outage_us)
+    # After every other draw, so these leave the rest of the seed where it was.
+    sweeps = side.randint(1, 3)
+    if "recovery_worker" in enabled:
+        for _ in range(sweeps):
+            commands.append(Command("sweep", _when(side)))
+    poison = (side.choices(ORDERS, weights)[0], side.choice(planner.PIPELINE))
+    return Plan(enabled, rates, stickiness, commands, retention_us, outage_us,
+                poison if "poison_step" in enabled else None)
