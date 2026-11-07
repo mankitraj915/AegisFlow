@@ -16,6 +16,17 @@ recorded, exactly like a crash at the after_tool hook, except that advance()
 returns normally and records run_interrupted. The run stays 'running' until
 resume() continues it with the same step and key.
 
+Reconciliation: an error from a side-effecting call says nothing about whether
+the effect happened: the response may have been lost, or the provider may be
+wrong. So before re-executing such a step, and before reporting any error from
+one, the engine asks the provider (tools.lookup). If the effect is there the step
+is recorded without another call. "No record" is believed only while the key is
+young enough that the provider can't have forgotten it (KEY_TRUST_S), and only as
+grounds for retrying under the same key, never as proof of failure, since a
+request may still be in flight. Whatever the lookup can't settle puts the run in
+'needs_review', which no driver leaves on its own: a later lookup that finds the
+effect (reconcile()) or a person (resolve()) has to settle it.
+
 Concurrency: every advance() first takes the run's lease in a write transaction,
 so normally one advance() drives a run at a time and another caller gets
 Conflict. The lease is released when advance() returns or raises, and one left
@@ -65,6 +76,8 @@ class RetryPolicy:
 
 RETRY_POLICY = RetryPolicy()
 LEASE_S = 60
+# How long a provider's "no record" can be believed. Must stay below its key retention.
+KEY_TRUST_S = 300
 
 
 class RunNotFound(Exception):
@@ -146,16 +159,20 @@ def _fenced_tx(conn, run_id: str, epoch: int):
         yield
 
 
+def _release(conn, run_id: str, epoch: int) -> None:
+    with tx(conn):
+        conn.execute(
+            "UPDATE runs SET lease_token=NULL, lease_expires_at=NULL WHERE id=? AND lease_epoch=?",
+            (run_id, epoch),
+        )
+
+
 def _drive(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
     """Advance under a lease the caller took, releasing it however advancing ends."""
     try:
         return _advance(conn, run_id, epoch, hook)
     finally:
-        with tx(conn):
-            conn.execute(
-                "UPDATE runs SET lease_token=NULL, lease_expires_at=NULL WHERE id=? AND lease_epoch=?",
-                (run_id, epoch),
-            )
+        _release(conn, run_id, epoch)
 
 
 def run_id_for_key(conn, idempotency_key: str) -> str | None:
@@ -248,6 +265,15 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
             attempt = pending["attempt"]
             if pending["next_attempt_at"] != waited_for:
                 _wait_for_backoff(pending["next_attempt_at"])
+            if name in tools.SIDE_EFFECTING:
+                view = _ask_provider(conn, run_id, idx, name, key, state)
+                if view.output is not None:
+                    with _fenced_tx(conn, run_id, epoch):
+                        _event(conn, run_id, "step_reconciled", {"idx": idx, "name": name, "idempotency_key": key})
+                        _write_success(conn, run_id, idx, name, attempt, view.output, state)
+                    continue
+                if view.doubt is not None:
+                    return _hold_for_review(conn, run_id, epoch, idx, name, key, view.doubt)
         else:
             name = planner.decide(state)
             if name is None:
@@ -287,17 +313,24 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
                     hook("retry_scheduled", name)
                 runtime.current.sleep(delay)  # Outside tx(): never hold the write lock while waiting.
                 continue
+            error = f"retries exhausted after {attempt} attempts: {exc}"
             info: dict = {"attempt": attempt, "retryable": True, "exhausted": True}
-            if name in tools.SIDE_EFFECTING:
-                # The effect may have committed before the failure; the key finds it.
-                info |= {"idempotency_key": key, "outcome_unknown": True}
-            return _fail(conn, run_id, epoch, idx, name, f"retries exhausted after {attempt} attempts: {exc}", info)
+            if name not in tools.SIDE_EFFECTING:
+                return _fail(conn, run_id, epoch, idx, name, error, info)
+            ended = _after_failed_call(conn, run_id, epoch, idx, name, key, attempt, state, error, info, True)
+            if ended is None:
+                continue
+            return ended
         except tools.ToolError as exc:
             info = {"attempt": attempt, "retryable": False}
-            if name in tools.SIDE_EFFECTING and pending is not None:
-                # An earlier execution of this step may have committed, or may still arrive.
-                info |= {"idempotency_key": key, "outcome_unknown": True}
-            return _fail(conn, run_id, epoch, idx, name, str(exc), info)
+            if name not in tools.SIDE_EFFECTING:
+                return _fail(conn, run_id, epoch, idx, name, str(exc), info)
+            # On a step's first execution a refusal with nothing at the provider is a known outcome.
+            in_flight = pending is not None
+            ended = _after_failed_call(conn, run_id, epoch, idx, name, key, attempt, state, str(exc), info, in_flight)
+            if ended is None:
+                continue
+            return ended
 
         if hook:
             hook("after_tool", name)
@@ -309,18 +342,74 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
             return "running"
 
         with _fenced_tx(conn, run_id, epoch):
-            conn.execute(
-                "UPDATE steps SET status='succeeded', output_json=?, finished_at=? WHERE run_id=? AND idx=?",
-                (_dumps(output), now(), run_id, idx),
-            )
-            state["outputs"][name] = output
-            conn.execute(
-                "INSERT INTO checkpoints(run_id, after_step_idx, state_json, ts) VALUES (?,?,?,?)",
-                (run_id, idx, _dumps(state), now()),
-            )
-            _event(conn, run_id, "step_succeeded", {
-                "idx": idx, "name": name, "attempt": attempt, "output": output,
+            _write_success(conn, run_id, idx, name, attempt, output, state)
+
+
+def _write_success(conn, run_id: str, idx: int, name: str, attempt: int, output: dict, state: dict) -> None:
+    """Record a step's result. Must be called inside a fenced transaction."""
+    conn.execute(
+        "UPDATE steps SET status='succeeded', output_json=?, finished_at=? WHERE run_id=? AND idx=?",
+        (_dumps(output), now(), run_id, idx),
+    )
+    state["outputs"][name] = output
+    conn.execute(
+        "INSERT INTO checkpoints(run_id, after_step_idx, state_json, ts) VALUES (?,?,?,?)",
+        (run_id, idx, _dumps(state), now()),
+    )
+    _event(conn, run_id, "step_succeeded", {"idx": idx, "name": name, "attempt": attempt, "output": output})
+
+
+@dataclass(frozen=True)
+class ProviderView:
+    """What a status lookup established. With an output, the effect happened; with
+    a doubt, nobody can tell. With neither, the provider has no record and can be
+    trusted to deduplicate a retry under the same key."""
+    output: dict | None = None
+    doubt: str | None = None
+
+
+def _ask_provider(conn, run_id: str, idx: int, name: str, key: str, state: dict) -> ProviderView:
+    try:
+        output = tools.lookup(conn, name, key, state)
+    except (tools.RetryableToolError, tools.ToolError) as exc:
+        return ProviderView(doubt=f"status lookup failed: {exc}")
+    if output is not None:
+        return ProviderView(output=output)
+    started_at = conn.execute("SELECT started_at FROM steps WHERE run_id=? AND idx=?", (run_id, idx)).fetchone()[0]
+    age = (datetime.fromisoformat(now()) - datetime.fromisoformat(started_at)).total_seconds()
+    if age >= KEY_TRUST_S:
+        return ProviderView(doubt=f"provider has no record of {key}, but it is {int(age)} s old and may be forgotten")
+    return ProviderView()
+
+
+def _after_failed_call(conn, run_id: str, epoch: int, idx: int, name: str, key: str, attempt: int, state: dict,
+                       error: str, info: dict, in_flight: bool) -> str | None:
+    """A side-effecting call failed for good. Returns how the run ended, or None if
+    the effect happened after all and the step is now recorded as a success."""
+    view = _ask_provider(conn, run_id, idx, name, key, state)
+    if view.output is not None:
+        with _fenced_tx(conn, run_id, epoch):
+            _event(conn, run_id, "step_reconciled", {
+                "idx": idx, "name": name, "idempotency_key": key, "reported_error": error,
             })
+            _write_success(conn, run_id, idx, name, attempt, view.output, state)
+        return None
+    if view.doubt is not None:
+        return _hold_for_review(conn, run_id, epoch, idx, name, key, f"{error}; {view.doubt}")
+    if in_flight:
+        return _hold_for_review(conn, run_id, epoch, idx, name, key,
+                                f"{error}; provider has no record, but an earlier request may still arrive")
+    return _fail(conn, run_id, epoch, idx, name, error, info)
+
+
+def _hold_for_review(conn, run_id: str, epoch: int, idx: int, name: str, key: str, reason: str) -> str:
+    """The outcome of a side-effecting step can't be established. Say so, and stop."""
+    with _fenced_tx(conn, run_id, epoch):
+        _set_status(conn, run_id, "needs_review", reason)
+        _event(conn, run_id, "run_needs_review", {
+            "idx": idx, "name": name, "idempotency_key": key, "outcome_unknown": True, "reason": reason,
+        })
+    return "needs_review"
 
 
 def _fail(conn, run_id: str, epoch: int, idx: int, name: str, error: str, info: dict) -> str:
@@ -412,6 +501,63 @@ def approve(conn, run_id: str, decided_by: str, hook: Hook | None = None) -> str
 def reject(conn, run_id: str, decided_by: str, reason: str | None = None) -> str:
     _decide(conn, run_id, "rejected", decided_by, reason)
     return "rejected"
+
+
+def _claim_review(conn, run_id: str):
+    """Take the lease on a run held for review. Returns (run, held step, epoch)."""
+    with tx(conn):
+        run = _get_run(conn, run_id)
+        if run["status"] != "needs_review":
+            raise Conflict(f"run {run_id} is {run['status']}; only a run held for review can be settled")
+        epoch = _claim(conn, run_id)
+    step = conn.execute(
+        "SELECT idx, name, idempotency_key, attempt FROM steps WHERE run_id=? AND status='started'", (run_id,)
+    ).fetchone()
+    return run, step, epoch
+
+
+def _clear_review(conn, run_id: str, epoch: int, step, output: dict, state: dict, by: str) -> None:
+    with _fenced_tx(conn, run_id, epoch):
+        _set_status(conn, run_id, "running")
+        _event(conn, run_id, "run_review_cleared", {
+            "idx": step["idx"], "name": step["name"], "idempotency_key": step["idempotency_key"], "by": by,
+        })
+        _write_success(conn, run_id, step["idx"], step["name"], step["attempt"], output, state)
+
+
+def reconcile(conn, run_id: str, hook: Hook | None = None) -> str:
+    """Ask the provider again about a run held for review. If the effect is there,
+    the run carries on; otherwise it stays held, because no record proves nothing."""
+    run, step, epoch = _claim_review(conn, run_id)
+    try:
+        state = _load_state(conn, run)
+        view = _ask_provider(conn, run_id, step["idx"], step["name"], step["idempotency_key"], state)
+        if view.output is None:
+            return "needs_review"
+        _clear_review(conn, run_id, epoch, step, view.output, state, "provider")
+        return _advance(conn, run_id, epoch, hook)
+    finally:
+        _release(conn, run_id, epoch)
+
+
+def resolve(conn, run_id: str, decided_by: str, outcome: str, hook: Hook | None = None) -> str:
+    """A person settles what the provider can't. They may say the effect happened
+    when the provider has forgotten it, but can't deny one the provider shows."""
+    run, step, epoch = _claim_review(conn, run_id)
+    try:
+        state = _load_state(conn, run)
+        idx, name, key = step["idx"], step["name"], step["idempotency_key"]
+        view = _ask_provider(conn, run_id, idx, name, key, state)
+        if outcome == "not_applied":
+            if view.output is not None:
+                raise Conflict(f"run {run_id}: the provider shows this effect under {key}")
+            error = f"{decided_by} confirmed that {name} did not happen"
+            return _fail(conn, run_id, epoch, idx, name, error, {"resolved_by": decided_by})
+        output = view.output or tools.EXPECTED_OUTPUT[name](key, state)
+        _clear_review(conn, run_id, epoch, step, output, state, decided_by)
+        return _advance(conn, run_id, epoch, hook)
+    finally:
+        _release(conn, run_id, epoch)
 
 
 # ---- reads ----

@@ -15,11 +15,12 @@ MAX_ATTEMPTS = engine.RETRY_POLICY.max_attempts
 POLICY = engine.RetryPolicy()
 TERMINAL = {"succeeded", "failed", "rejected"}
 LEGAL_RUN_MOVES = {
-    "running": {"awaiting_approval", "succeeded", "failed"},
+    "running": {"awaiting_approval", "needs_review", "succeeded", "failed"},
     "awaiting_approval": {"running", "rejected"},
+    "needs_review": {"running", "failed"},
 }
 LEGAL_STEP_MOVES = {"started": {"succeeded", "failed"}}
-RUN_RANK = {"running": 0, "awaiting_approval": 0, **{s: 1 for s in TERMINAL}}
+RUN_RANK = {"running": 0, "awaiting_approval": 0, "needs_review": 0, **{s: 1 for s in TERMINAL}}
 
 # Every invariant, so a survey can report the ones that never fired.
 INVARIANTS = (
@@ -43,7 +44,8 @@ INVARIANTS = (
     "effect_on_rejected",
     "gate_bypassed",
     "double_decision",
-    "undisclosed_effect_on_failed_step",
+    "unknown_reported_as_failure",
+    "ledger_mismatch",
     "undisclosed_effect_before_failure",
     "request_ran_twice",
     "read_path_writes",
@@ -276,16 +278,25 @@ class Checker:
             if planner.approval_reason("issue_refund", state):
                 self.fail("gate_bypassed", f"{short} refunded with no approval")
 
-        if run["status"] == "failed" and refunds:
+        if run["status"] == "failed":
             failure: dict = next((p for _, t, p in events if t == "run_failed"), {})
             failed_step = next((s for s in steps.values() if s["status"] == "failed"), None)
-            refund_failed = failed_step is not None and failed_step["name"] == "issue_refund"
-            if refund_failed and not failure.get("outcome_unknown"):
-                self.fail("undisclosed_effect_on_failed_step", f"{short} failed at issue_refund with a refund "
-                          "in the ledger and no outcome_unknown")
-            elif not refund_failed and not failure.get("effects_committed"):
+            failed_name = failed_step["name"] if failed_step else None
+            failed_key = failed_step["idempotency_key"] if failed_step else ""
+            if failed_name in tools.SIDE_EFFECTING and self.world.ledger.truly_has(failed_key):
+                self.fail("unknown_reported_as_failure", f"{short} reported {failed_name} as failed "
+                          "and the provider did it")
+            if refunds and failed_name != "issue_refund" and not failure.get("effects_committed"):
                 self.fail("undisclosed_effect_before_failure", f"{short} failed after its refund committed "
                           "without saying so")
+
+        # While a run is held for review the books are allowed to be unsettled, and say so.
+        if run["status"] != "needs_review":
+            recorded = sum(json.loads(s["output_json"])["amount_paise"] for s in steps.values()
+                           if s["name"] == "issue_refund" and s["status"] == "succeeded")
+            actual = sum(r["amount_paise"] for r in refunds)
+            if recorded != actual:
+                self.fail("ledger_mismatch", f"{short} recorded {recorded} paise, the provider holds {actual}")
 
     def _check_history(self, run_id: str, run: dict, steps: dict, events: list) -> None:
         """Rebuild the run from its events alone and compare with the tables."""
@@ -299,8 +310,10 @@ class Checker:
             idx = payload.get("idx")
             if type_ == "approval_requested":
                 status = "awaiting_approval"
-            elif type_ == "approval_approved":
+            elif type_ in ("approval_approved", "run_review_cleared"):
                 status = "running"
+            elif type_ == "run_needs_review":
+                status = "needs_review"
             elif type_ == "run_rejected":
                 status, terminal_events = "rejected", terminal_events + 1
             elif type_ == "run_succeeded":

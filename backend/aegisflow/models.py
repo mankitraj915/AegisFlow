@@ -15,6 +15,8 @@ class Scenario(BaseModel):
     # Deterministic fault injection: step name -> outcome of attempts 1..n.
     # Attempts beyond the list run normally.
     faults: dict[str, Annotated[list[FaultKind], Field(max_length=10)]] = Field(default_factory=dict)
+    # Fault injection: the provider's status lookup can't be reached for this run.
+    provider_status_down: bool = False
 
     @field_validator("faults")
     @classmethod
@@ -39,6 +41,11 @@ class CreateRun(BaseModel):
 class Decision(BaseModel):
     decided_by: str = Field(min_length=1, max_length=100)
     reason: str | None = Field(None, max_length=500)
+
+
+class Resolution(BaseModel):
+    decided_by: str = Field(min_length=1, max_length=100)
+    outcome: Literal["applied", "not_applied"]
 
 
 class RunOut(BaseModel):

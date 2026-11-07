@@ -24,18 +24,7 @@ _RECORD_FIRST = """        if name == "issue_refund":
             output = {"refund_id": key, "order_id": state["order_id"],
                       "amount_paise": state["outputs"]["propose_refund"]["amount_paise"]}
             with _fenced_tx(conn, run_id, epoch):
-                conn.execute(
-                    "UPDATE steps SET status='succeeded', output_json=?, finished_at=? WHERE run_id=? AND idx=?",
-                    (_dumps(output), now(), run_id, idx),
-                )
-                state["outputs"][name] = output
-                conn.execute(
-                    "INSERT INTO checkpoints(run_id, after_step_idx, state_json, ts) VALUES (?,?,?,?)",
-                    (run_id, idx, _dumps(state), now()),
-                )
-                _event(conn, run_id, "step_succeeded", {
-                    "idx": idx, "name": name, "attempt": attempt, "output": output,
-                })
+                _write_success(conn, run_id, idx, name, attempt, output, state)
             try:
                 tools.call(conn, name, key, state, attempt)
             except (tools.RetryableToolError, tools.ToolError):
@@ -59,7 +48,7 @@ MUTATIONS = {m.name: m for m in (
     # The three the brief names.
     Mutation("skip_idempotency_check", "the ledger ignores the idempotency key",
              # The cap refuses the duplicate money, so the damage shows up as a run misreporting its refund.
-             ("effect_duplicated", "refund_cap", "undisclosed_effect_on_failed_step"), _IGNORE_REFUND_KEY),
+             ("effect_duplicated", "refund_cap", "ledger_mismatch"), _IGNORE_REFUND_KEY),
     Mutation("skip_idempotency_check_and_cap", "the same, with the order cap also gone, so nothing stops a duplicate",
              ("effect_duplicated", "refund_cap"), _IGNORE_REFUND_KEY + _NO_CAP_TRIGGER),
     Mutation("record_progress_first", "issue_refund is recorded as done before the refund is attempted",
@@ -83,9 +72,10 @@ MUTATIONS = {m.name: m for m in (
              ("request_ran_twice",),
              (("aegisflow.engine", "if idempotency_key is not None:", "if False:"),
               ("aegisflow.engine", "now(), now(), idempotency_key),", "now(), now(), None),"))),
-    Mutation("lose_outcome_unknown", "a fatal error on a retried refund claims a known outcome (P1)",
-             ("undisclosed_effect_on_failed_step",),
-             (("aegisflow.engine", "if name in tools.SIDE_EFFECTING and pending is not None:", "if False:"),)),
+    Mutation("lose_outcome_unknown", "a fatal error on a retried effect claims a known outcome (P1)",
+             ("unknown_reported_as_failure",),
+             (("aegisflow.engine", "    if in_flight:\n        return _hold_for_review",
+               "    if False:\n        return _hold_for_review"),)),
     Mutation("hide_committed_effects", "a run failing after its refund doesn't say the refund happened (P7)",
              ("undisclosed_effect_before_failure",),
              (("aegisflow.engine", "if committed:", "if False:"),)),
@@ -119,11 +109,13 @@ MUTATIONS = {m.name: m for m in (
              (("aegisflow.engine", "if _needs_approval(conn, run_id, epoch, idx, name, state):", "if False:"),)),
     Mutation("split_progress_record", "a step's result and its event commit in separate transactions",
              ("history_mismatch",),
-             (("aegisflow.engine", '                (run_id, idx, _dumps(state), now()),\n            )\n'
-               '            _event(conn, run_id, "step_succeeded", {',
-               '                (run_id, idx, _dumps(state), now()),\n            )\n'
-               '        with _fenced_tx(conn, run_id, epoch):\n'
-               '            _event(conn, run_id, "step_succeeded", {'),)),
+             (("aegisflow.engine", '_write_success(conn, run_id, idx, name, attempt, output, state)\n\n\n',
+               '_write_success(conn, run_id, idx, name, attempt, output, state, split=epoch)\n\n\n'),
+              ("aegisflow.engine", 'output: dict, state: dict) -> None:\n    """Record a step\'s result.',
+               'output: dict, state: dict, split=None) -> None:\n    """Record a step\'s result.'),
+              ("aegisflow.engine", '    _event(conn, run_id, "step_succeeded", {"idx": idx,',
+               '    if split is not None:\n        conn.execute("COMMIT")\n        conn.execute("BEGIN IMMEDIATE")\n'
+               '    _event(conn, run_id, "step_succeeded", {"idx": idx,'),)),
     Mutation("decide_twice", "a decision applies even when no approval is pending",
              ("double_decision", "terminal_changed", "illegal_transition"),
              (("aegisflow.engine", "\"WHERE run_id=? AND status='pending' \"", '"WHERE run_id=? "'),

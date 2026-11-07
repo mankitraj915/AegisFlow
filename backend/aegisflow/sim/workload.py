@@ -22,16 +22,17 @@ FAULT_RATES: dict[str, tuple[float, float]] = {
     "tool_delay": (0.03, 0.3),
     "tool_stall": (0.02, 0.2),
     "tool_late_delivery": (0.03, 0.2),
-    # A less forgiving provider: it reports an error for a request it executed, and
-    # answers a retry with the failure it gave the earlier request.
+    # A less forgiving provider: it reports an error for a request it executed, answers
+    # a retry with the failure it gave the earlier request, and can't always say what it did.
     "provider_false_error": (0.03, 0.3),
     "provider_stale_response": (0.1, 0.5),
+    "status_unavailable": (0.03, 0.3),
 }
 # Workload shapes, switched per seed like faults.
 SHAPES = ("duplicate_commands", "scenario_faults", "readers", "stale_operators", "provider_forgets")
-# Not yet in every seed's draw: run with `survey --also`.
-OPT_IN = {"provider_false_error", "provider_stale_response", "provider_forgets"}
-FEATURES = tuple(f for f in (*FAULT_RATES, *SHAPES) if f not in OPT_IN)
+# Newer features draw from a stream of their own, so adding one leaves each seed's other draws alone.
+SIDE_FEATURES = ("provider_false_error", "provider_stale_response", "status_unavailable", "provider_forgets")
+FEATURES = tuple(f for f in (*FAULT_RATES, *SHAPES) if f not in SIDE_FEATURES)
 # How long a forgetful provider remembers a key, and how long an outage can age a run.
 RETENTION_S = (310, 700)
 LONG_OUTAGE_S = 800
@@ -87,20 +88,18 @@ def _scenario(rng: random.Random, with_faults: bool) -> dict:
     return scenario
 
 
-def make_plan(seed: int, only: set[str] | None = None, without: set[str] | frozenset[str] = frozenset(),
-              also: set[str] | frozenset[str] = frozenset()) -> Plan:
+def make_plan(seed: int, only: set[str] | None = None, without: set[str] | frozenset[str] = frozenset()) -> Plan:
     rng = random.Random(f"{seed}:plan")
     # Swarm testing: each seed runs a random subset of faults, so one fault's
     # failures can't always mask the rarer path that another fault needs.
     enabled = {f for f in FEATURES if rng.random() < 0.4}
-    rates = {f: rng.uniform(*span) for f, span in FAULT_RATES.items() if f not in OPT_IN}
+    rates = {f: rng.uniform(*span) for f, span in FAULT_RATES.items() if f not in SIDE_FEATURES}
     stickiness = rng.choice([0.0, 0.5, 0.9])
+    side = random.Random(f"{seed}:side")
+    rates |= {f: side.uniform(*span) for f, span in FAULT_RATES.items() if f in SIDE_FEATURES}
+    enabled |= {f for f in SIDE_FEATURES if side.random() < 0.4}
     if only is not None:
         enabled = set(only)
-    # Drawn from their own stream, so an opt-in feature leaves the seed's other draws alone.
-    side = random.Random(f"{seed}:side")
-    rates |= {f: side.uniform(*span) for f, span in FAULT_RATES.items() if f in OPT_IN}
-    enabled |= {f for f in also if side.random() < 0.5}
     enabled -= set(without)
     retention_us = side.randrange(*RETENTION_S) * 1_000_000
     outage_us = side.randrange(LONG_OUTAGE_S) * 1_000_000 if "provider_forgets" in enabled else 0
@@ -110,6 +109,8 @@ def make_plan(seed: int, only: set[str] | None = None, without: set[str] | froze
     for i in range(rng.randint(1, 3)):
         order = rng.choices(ORDERS, weights)[0]
         scenario = _scenario(rng, "scenario_faults" in enabled)
+        if "scenario_faults" in enabled and side.random() < 0.1:
+            scenario["provider_status_down"] = True
         at = _when(rng)
         commands.append(Command("create", at, order, scenario, request_id=f"req-{i}"))
         retried = rng.random() < 0.5

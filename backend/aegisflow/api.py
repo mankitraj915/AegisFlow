@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import engine, tools
 from .db import connect
-from .models import AvailableOrder, CreateRun, Decision, EventOut, RunDetail, RunOut
+from .models import AvailableOrder, CreateRun, Decision, EventOut, Resolution, RunDetail, RunOut
 
 # Built frontend, relative to the source tree (backend/aegisflow -> frontend/dist).
 DEFAULT_FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
@@ -82,6 +82,16 @@ def create_app(db_path: str | None = None, max_runs: int | None = None) -> FastA
     @app.post("/runs/{run_id}/resume", response_model=RunOut)
     def resume(run_id: str, conn=Depends(get_conn)):
         guarded(engine.resume, conn, run_id)
+        return engine.get_run(conn, run_id)
+
+    @app.post("/runs/{run_id}/reconcile", response_model=RunOut)
+    def reconcile(run_id: str, conn=Depends(get_conn)):
+        guarded(engine.reconcile, conn, run_id)
+        return engine.get_run(conn, run_id)
+
+    @app.post("/runs/{run_id}/resolve", response_model=RunOut)
+    def resolve(run_id: str, body: Resolution, conn=Depends(get_conn)):
+        guarded(engine.resolve, conn, run_id, body.decided_by, body.outcome)
         return engine.get_run(conn, run_id)
 
     @app.post("/runs/{run_id}/reject", response_model=RunOut)

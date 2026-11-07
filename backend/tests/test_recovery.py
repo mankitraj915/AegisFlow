@@ -57,7 +57,8 @@ def test_interruption_after_refund_commit_leaves_run_resumable(conn):
     types = [e.type for e in history]
     refund_events = [(e.type, e.payload.get("idempotency_key")) for e in history if e.payload.get("idx") == 4]
     assert refund_events == [
-        ("step_started", None), ("run_interrupted", key), ("run_resumed", key), ("step_succeeded", None),
+        ("step_started", None), ("run_interrupted", key), ("run_resumed", key), ("step_reconciled", key),
+        ("step_succeeded", None),
     ]
     assert types.count("run_interrupted") == 1 and types[-1] == "run_succeeded"
     assert [e.seq for e in history] == list(range(1, len(history) + 1))
@@ -88,8 +89,8 @@ def test_concurrent_advance_is_refused_while_run_is_held(db_path):
     run_id = engine.start_run(setup, "ORD-1001", INTERRUPT_REFUND)
     inside, release, results = threading.Event(), threading.Event(), []
 
-    def hold(point, name):
-        if point == "after_tool" and name == "issue_refund":
+    def hold(point, name):  # The refund is found by asking, so the next tool call is the notification.
+        if point == "after_tool" and name == "notify_customer":
             inside.set()
             release.wait(5)
 
@@ -211,7 +212,7 @@ def test_a_stale_driver_with_no_successor_may_still_finish(db_path, monkeypatch)
 
 def test_interrupted_flag_follows_persisted_events(conn):
     def crash(point, name):
-        if point == "after_tool" and name == "issue_refund":
+        if point == "after_tool" and name == "notify_customer":
             raise RuntimeError("simulated crash")
 
     plain = engine.start_run(conn, "ORD-1001", Scenario())
@@ -284,7 +285,7 @@ def test_resume_after_real_process_death(db_path, monkeypatch):
     assert [(e.type, e.payload.get("idx")) for e in history] == [("run_created", None)] + [
         (t, i) for i in range(4) for t in ("step_started", "step_succeeded")
     ] + [
-        ("step_started", 4), ("run_resumed", 4), ("step_succeeded", 4),
+        ("step_started", 4), ("run_resumed", 4), ("step_reconciled", 4), ("step_succeeded", 4),
         ("step_started", 5), ("step_succeeded", 5), ("run_succeeded", None),
     ]
     assert history[10].type == "run_resumed" and history[10].payload["idempotency_key"] == key

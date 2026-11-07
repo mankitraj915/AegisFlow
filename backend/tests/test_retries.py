@@ -179,43 +179,38 @@ def test_backoff_wait_is_capped_if_the_clock_jumped_back(conn, sleeps, monkeypat
     assert sleeps == [engine.RETRY_POLICY.max_delay_s]
 
 
-def test_exhaustion_after_refund_commit_marks_outcome_unknown(conn):
-    run_id = engine.start_run(conn, "ORD-1001", faults(issue_refund=["retryable_after_commit"] * 3))
-    assert status(conn, run_id) == "failed"
+def test_exhaustion_with_nothing_found_holds_the_run_instead_of_failing_it(conn):
+    run_id = engine.start_run(conn, "ORD-1001", faults(issue_refund=["retryable"] * 3))
+    assert status(conn, run_id) == "needs_review"
     key = step(conn, run_id, "issue_refund")["idempotency_key"]
-    for type_ in ("step_failed", "run_failed"):
-        payload = events(conn, run_id, type_)[0].payload
-        assert payload["outcome_unknown"] is True and payload["idempotency_key"] == key
-    ledger = refunds(conn)
-    assert len(ledger) == 1 and ledger[0]["idempotency_key"] == key
+    payload = events(conn, run_id, "run_needs_review")[0].payload
+    assert payload["outcome_unknown"] is True and payload["idempotency_key"] == key
+    assert not events(conn, run_id, "run_failed") and not refunds(conn)
     assert [x["name"] for x in steps(conn, run_id)] == PIPELINE[:5]  # never notifies
-    assert engine.advance(conn, run_id) == "failed"
-    assert len(refunds(conn)) == 1 and len(steps(conn, run_id)) == 5
+    assert engine.advance(conn, run_id) == "needs_review"
+    assert not refunds(conn) and len(steps(conn, run_id)) == 5
 
 
-def test_fatal_error_after_refund_commit_marks_outcome_unknown(conn):
-    run_id = engine.start_run(conn, "ORD-1001", faults(issue_refund=["retryable_after_commit", "fatal"]))
-    assert status(conn, run_id) == "failed"
-    key = step(conn, run_id, "issue_refund")["idempotency_key"]
-    for type_ in ("step_failed", "run_failed"):
-        payload = events(conn, run_id, type_)[0].payload
-        assert payload["outcome_unknown"] is True and payload["idempotency_key"] == key
-        assert payload["retryable"] is False
-    assert [r["idempotency_key"] for r in refunds(conn)] == [key]
+def test_a_refund_committed_before_a_timeout_is_recorded_once_whatever_was_planned_next(conn):
+    plans = ((["retryable_after_commit"] * 3, "ORD-1001"), (["retryable_after_commit", "fatal"], "ORD-1002"))
+    for plan, order in plans:
+        run_id = engine.start_run(conn, order, faults(issue_refund=plan))
+        assert status(conn, run_id) == "succeeded"  # The lookup settled it; attempt 2 never ran.
+        assert step(conn, run_id, "issue_refund")["attempt"] == 2
+    assert len(refunds(conn)) == 2
 
 
-def test_fatal_error_on_resume_after_a_crash_marks_outcome_unknown(conn):
-    def crash_then_refuse(point, name):
+def test_resuming_after_a_crash_finds_the_refund_before_any_planned_fault_can_fire(conn):
+    def crash(point, name):
         if point == "after_tool" and name == "issue_refund":
             raise RuntimeError("simulated crash")
 
     with pytest.raises(RuntimeError):
-        engine.start_run(conn, "ORD-1001", Scenario(), hook=crash_then_refuse)
+        engine.start_run(conn, "ORD-1001", Scenario(), hook=crash)
     run_id = only_run(conn)
     conn.execute("UPDATE runs SET scenario_json=? WHERE id=?",
                  (faults(issue_refund=["fatal"]).model_dump_json(), run_id))
-    assert engine.advance(conn, run_id) == "failed"
-    assert events(conn, run_id, "run_failed")[0].payload["outcome_unknown"] is True
+    assert engine.advance(conn, run_id) == "succeeded"
     assert len(refunds(conn)) == 1
 
 

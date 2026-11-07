@@ -13,7 +13,7 @@ from .storage import DurableWal, SimConn, raw_connect
 from .workload import Command, Plan
 
 OPERATOR_ROUNDS = 12
-ANY_STATUS = {"running", "awaiting_approval", "succeeded", "failed", "rejected"}
+ANY_STATUS = {"running", "awaiting_approval", "needs_review", "succeeded", "failed", "rejected"}
 EXPECTED_ERRORS = (engine.Conflict, engine.RunNotFound, engine.OrderNotFound)
 
 
@@ -49,6 +49,19 @@ class _Provider(tools.SqlLedger):
         if delivered:
             self.deliveries[key] += 1
         return delivered
+
+    def refund_status(self, key: str) -> dict | None:
+        return None if self.forgotten(key) else super().refund_status(key)
+
+    def message_status(self, key: str) -> dict | None:
+        return None if self.forgotten(key) else super().message_status(key)
+
+    def truly_has(self, key: str) -> bool:
+        """What really happened, whatever the provider now remembers. Only the
+        checker and a person going through the provider's records get to know this."""
+        query = "SELECT 1 FROM {} WHERE idempotency_key = ? OR idempotency_key LIKE ?"
+        return any(self.conn.execute(query.format(table), (key, f"{key}#%")).fetchone()
+                   for table in ("refunds", "notifications"))
 
 
 class World:
@@ -86,6 +99,7 @@ class World:
             sleep=lambda seconds: self.sched.sleep_us(int(seconds * 1_000_000)),
             open_db=self._open_db,
             invoke=self._invoke,
+            lookup=self._lookup,
             ledger=lambda conn: self.ledger,
         )
 
@@ -189,6 +203,15 @@ class World:
             raise tools.RetryableToolError("simulated: response lost")
         return output
 
+    def _lookup(self, name: str, key: str, call) -> dict | None:
+        self.sched.step(f"status {name}")
+        if self.on("status_unavailable"):
+            raise tools.RetryableToolError("simulated: status lookup unavailable")
+        found = call()
+        if self.on("tool_delay"):
+            self.sched.sleep_us(self._values.randrange(1_000, 3_000_000))  # Stale by the time it arrives.
+        return found
+
     def _apply(self, call) -> dict:
         output = call()
         self._notify("external_changed")
@@ -237,6 +260,8 @@ class World:
             run_id = self._pick_run(conn, ANY_STATUS, command.pick)
         elif action in ("approve", "reject"):
             run_id = self._pick_run(conn, {"awaiting_approval"}, command.pick)
+        elif action == "reconcile":
+            run_id = self._pick_run(conn, {"needs_review"}, command.pick)
         else:
             run_id = self._pick_run(conn, {"running", "awaiting_approval"}, command.pick)
         if run_id is None:
@@ -268,11 +293,22 @@ class World:
                         engine.approve(conn, run.id, "operator")
                     else:
                         engine.reject(conn, run.id, "operator", "simulated")
+                elif run.status == "needs_review" and engine.reconcile(conn, run.id) == "needs_review":
+                    self._settle_by_hand(conn, run.id)
             except engine.Conflict:
                 pass
 
+    def _settle_by_hand(self, conn, run_id: str) -> None:
+        """A person checks the provider's records, once nothing is in flight any more."""
+        held = conn.execute("SELECT idempotency_key FROM steps WHERE run_id=? AND status='started'",
+                            (run_id,)).fetchone()
+        outcome = "applied" if self.ledger.truly_has(held["idempotency_key"]) else "not_applied"
+        engine.resolve(conn, run_id, "operator", outcome)
+
     def unfinished(self) -> list[str]:
-        rows = self.keeper.execute("SELECT id FROM runs WHERE status IN ('running', 'awaiting_approval') ORDER BY id")
+        rows = self.keeper.execute(
+            "SELECT id FROM runs WHERE status IN ('running', 'awaiting_approval', 'needs_review') ORDER BY id"
+        )
         return [r["id"] for r in rows]
 
     def settle(self) -> None:

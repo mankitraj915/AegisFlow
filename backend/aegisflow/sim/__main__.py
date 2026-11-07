@@ -72,9 +72,8 @@ def cmd_survey(args) -> int:
     started = time.perf_counter()
     first: dict[str, int] = {}
     count: Counter = Counter()
-    also = frozenset(args.also.split(",")) if args.also else frozenset()
     for seed in range(args.start, args.start + args.seeds):
-        for invariant in simulate(seed, also=also).invariants():
+        for invariant in simulate(seed).invariants():
             first.setdefault(invariant, seed)
             count[invariant] += 1
     elapsed = time.perf_counter() - started
@@ -138,7 +137,6 @@ def main(argv: list[str] | None = None) -> int:
     survey = commands.add_parser("survey", help="report how many seeds each invariant takes to break")
     survey.add_argument("--seeds", type=int, default=1000)
     survey.add_argument("--start", type=int, default=0)
-    survey.add_argument("--also", help="comma-separated opt-in features, each on for half the seeds")
     survey.set_defaults(fn=cmd_survey)
 
     controls = commands.add_parser("controls", help="reintroduce known bugs and count the seeds to catch each")

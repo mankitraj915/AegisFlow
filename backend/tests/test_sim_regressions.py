@@ -12,19 +12,19 @@ from aegisflow.sim.run import simulate
 
 # (control, seed, invariant it breaks)
 ENGINE_BUGS = [
-    ("lose_outcome_unknown", 285, "undisclosed_effect_on_failed_step"),  # P1
+    ("lose_outcome_unknown", 439, "unknown_reported_as_failure"),  # P1
     ("no_fencing", 268, "history_mismatch"),  # P2
     ("no_order_cap", 8, "refund_cap"),  # P3
     ("ignore_request_key", 14, "request_ran_twice"),  # P3
     ("volatile_backoff", 2989, "backoff_skipped"),  # P4
     ("write_on_connect", 2, "read_path_writes"),  # P5
     ("notify_ignores_key", 19, "notified_twice"),  # P6
-    ("hide_committed_effects", 5, "undisclosed_effect_before_failure"),  # P7
+    ("hide_committed_effects", 28, "undisclosed_effect_before_failure"),  # P7
 ]
 
 # The bug classes the design has to rule out.
 CLASSES = [
-    ("skip_idempotency_check", 108, "undisclosed_effect_on_failed_step"),
+    ("skip_idempotency_check", 5, "ledger_mismatch"),
     ("skip_idempotency_check_and_cap", 8, "refund_cap"),
     ("record_progress_first", 8, "succeeded_without_effect"),
     ("drop_fsync", 12, "ack_lost"),
