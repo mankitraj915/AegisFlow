@@ -145,6 +145,41 @@ def test_crash_during_backoff_keeps_retry_budget(conn, sleeps):
     assert step(conn, run_id, "fetch_customer")["attempt"] == 3
 
 
+def test_backoff_survives_a_crash(conn, sleeps, monkeypatch):
+    with pytest.raises(RuntimeError):
+        engine.start_run(conn, "ORD-1001", faults(fetch_customer=["retryable"]),
+                         hook=crash_at("retry_scheduled", "fetch_customer"))
+    run_id = only_run(conn)
+    assert sleeps == []  # The crash came before the wait.
+    failed = events(conn, run_id, "step_attempt_failed")[0]
+    # Resume exactly when the failure happened: the whole delay is still owed.
+    monkeypatch.setattr(engine, "now", lambda: failed.ts)
+    assert engine.advance(conn, run_id) == "succeeded"
+    assert sleeps == [pytest.approx(0.1)]
+
+
+def test_backoff_already_over_is_not_waited_for_again(conn, sleeps, monkeypatch):
+    with pytest.raises(RuntimeError):
+        engine.start_run(conn, "ORD-1001", faults(fetch_customer=["retryable"]),
+                         hook=crash_at("retry_scheduled", "fetch_customer"))
+    run_id = only_run(conn)
+    next_at = conn.execute("SELECT next_attempt_at FROM steps WHERE run_id=? AND idx=1", (run_id,)).fetchone()[0]
+    monkeypatch.setattr(engine, "now", lambda: next_at)
+    assert engine.advance(conn, run_id) == "succeeded"
+    assert sleeps == []
+
+
+def test_backoff_wait_is_capped_if_the_clock_jumped_back(conn, sleeps, monkeypatch):
+    with pytest.raises(RuntimeError):
+        engine.start_run(conn, "ORD-1001", faults(fetch_customer=["retryable"]),
+                         hook=crash_at("retry_scheduled", "fetch_customer"))
+    run_id = only_run(conn)
+    monkeypatch.setattr(engine, "now", lambda: "2000-01-01T00:00:00+00:00")
+    conn.execute("UPDATE runs SET lease_token=NULL")
+    assert engine.advance(conn, run_id) == "succeeded"
+    assert sleeps == [engine.RETRY_POLICY.max_delay_s]
+
+
 def test_exhaustion_after_refund_commit_marks_outcome_unknown(conn):
     run_id = engine.start_run(conn, "ORD-1001", faults(issue_refund=["retryable_after_commit"] * 3))
     assert status(conn, run_id) == "failed"

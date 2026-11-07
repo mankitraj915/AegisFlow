@@ -195,7 +195,17 @@ def resume(conn, run_id: str, hook: Hook | None = None) -> str:
     return _drive(conn, run_id, epoch, hook)
 
 
+def _wait_for_backoff(next_attempt_at: str | None) -> None:
+    """Whoever picks up a step mid-backoff waits out what's left of it. Capped
+    because the clock may have jumped back since the delay was scheduled."""
+    if next_attempt_at is not None:
+        remaining = (datetime.fromisoformat(next_attempt_at) - datetime.fromisoformat(now())).total_seconds()
+        if remaining > 0:
+            runtime.current.sleep(min(remaining, RETRY_POLICY.max_delay_s))
+
+
 def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
+    waited_for = None  # The backoff this driver has already slept through itself.
     while True:
         run = _get_run(conn, run_id)
         if run["lease_epoch"] != epoch:
@@ -205,12 +215,15 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
         state = _load_state(conn, run)
 
         pending = conn.execute(
-            "SELECT idx, name, idempotency_key, attempt FROM steps WHERE run_id=? AND status='started'",
+            "SELECT idx, name, idempotency_key, attempt, next_attempt_at FROM steps "
+            "WHERE run_id=? AND status='started'",
             (run_id,),
         ).fetchone()
         if pending is not None:
             idx, name, key = pending["idx"], pending["name"], pending["idempotency_key"]
             attempt = pending["attempt"]
+            if pending["next_attempt_at"] != waited_for:
+                _wait_for_backoff(pending["next_attempt_at"])
         else:
             name = planner.decide(state)
             if name is None:
@@ -236,10 +249,11 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
         except tools.RetryableToolError as exc:
             if attempt < RETRY_POLICY.max_attempts:
                 delay = RETRY_POLICY.delay(attempt)
+                waited_for = (datetime.fromisoformat(now()) + timedelta(seconds=delay)).isoformat()
                 with _fenced_tx(conn, run_id, epoch):
                     conn.execute(
-                        "UPDATE steps SET attempt=attempt+1, error=? WHERE run_id=? AND idx=?",
-                        (str(exc), run_id, idx),
+                        "UPDATE steps SET attempt=attempt+1, error=?, next_attempt_at=? WHERE run_id=? AND idx=?",
+                        (str(exc), waited_for, run_id, idx),
                     )
                     _event(conn, run_id, "step_attempt_failed", {
                         "idx": idx, "name": name, "attempt": attempt, "error": str(exc),
