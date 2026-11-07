@@ -2,8 +2,10 @@
 import argparse
 import sys
 import time
+from collections import Counter
 
-from .run import Result, simulate
+from .checker import INVARIANTS
+from .run import Result, shrink, simulate
 from .workload import FEATURES
 
 
@@ -17,8 +19,8 @@ def _features(text: str | None) -> set[str] | None:
     return chosen
 
 
-def repro_command(result: Result, only: set[str] | None = None) -> str:
-    command = f"python -m aegisflow.sim replay --seed {result.seed}"
+def repro_command(seed: int, only: set[str] | None = None) -> str:
+    command = f"python -m aegisflow.sim replay --seed {seed}"
     if only is not None:
         command += f" --only {','.join(sorted(only)) or ','}"
     return command
@@ -28,7 +30,7 @@ def _report_failure(result: Result) -> None:
     print(f"\nFAILED seed {result.seed}")
     for failure in result.failures():
         print(f"  {failure}")
-    print(f"  reproduce: {repro_command(result)}")
+    print(f"  reproduce: {repro_command(result.seed, shrink(result.seed, result.violations[0][0]))}")
 
 
 def cmd_run(args) -> int:
@@ -63,6 +65,27 @@ def cmd_replay(args) -> int:
     return 1 if failures else 0
 
 
+def cmd_survey(args) -> int:
+    """How many seeds each invariant takes to break. Doesn't stop at the first failure."""
+    started = time.perf_counter()
+    first: dict[str, int] = {}
+    count: Counter = Counter()
+    for seed in range(args.start, args.start + args.seeds):
+        for invariant in simulate(seed).invariants():
+            first.setdefault(invariant, seed)
+            count[invariant] += 1
+    elapsed = time.perf_counter() - started
+    print(f"{args.seeds} seeds ({args.start}..{seed}) in {elapsed:.1f} s")
+    print(f"{'invariant':36} {'first seed':>10} {'seeds to find':>13} {'failing seeds':>13}")
+    for invariant in INVARIANTS:
+        if invariant in first:
+            to_find = first[invariant] - args.start + 1
+            print(f"{invariant:36} {first[invariant]:>10} {to_find:>13} {count[invariant]:>13}")
+        else:
+            print(f"{invariant:36} {'-':>10} {'-':>13} {0:>13}")
+    return 1 if first else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m aegisflow.sim")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -79,6 +102,11 @@ def main(argv: list[str] | None = None) -> int:
     replay.add_argument("--only", help="comma-separated features to enable, instead of the seed's own")
     replay.add_argument("--trace", action="store_true", help="print every scheduling step")
     replay.set_defaults(fn=cmd_replay)
+
+    survey = commands.add_parser("survey", help="report how many seeds each invariant takes to break")
+    survey.add_argument("--seeds", type=int, default=1000)
+    survey.add_argument("--start", type=int, default=0)
+    survey.set_defaults(fn=cmd_survey)
 
     args = parser.parse_args(argv)
     return args.fn(args)

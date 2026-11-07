@@ -171,6 +171,7 @@ class World:
     def _do_create(self, conn, command: Command) -> None:
         run_id = engine.start_run(conn, command.order_id, Scenario(**command.scenario))
         run = engine.get_run(conn, run_id)
+        self._notify("request_replied", command.request_id, run_id)
         self._notify("replied", self.sched.current, "create", run.status, run_id)
 
     def _pick_run(self, conn, statuses: set[str], pick: float) -> str | None:
@@ -224,6 +225,7 @@ class World:
         finish up. Whatever's still unfinished after that is stuck for good."""
         self.sched.run_until_idle()
         self.faults_on = False
+        self.keeper.executescript(db.SCHEMA)  # A crash may have beaten every connect() to it.
         for number in range(OPERATOR_ROUNDS):
             if not self.unfinished():
                 return
