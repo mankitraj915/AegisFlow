@@ -185,6 +185,19 @@ def test_fatal_error_on_resume_after_a_crash_marks_outcome_unknown(conn):
     assert len(refunds(conn)) == 1
 
 
+def test_failure_after_the_refund_names_the_committed_refund(conn):
+    run_id = engine.start_run(conn, "ORD-1001", faults(notify_customer=["fatal"]))
+    assert status(conn, run_id) == "failed"
+    key = step(conn, run_id, "issue_refund")["idempotency_key"]
+    assert events(conn, run_id, "run_failed")[0].payload["effects_committed"] == [key]
+    assert [r["idempotency_key"] for r in refunds(conn)] == [key]
+
+
+def test_failure_before_the_refund_names_nothing(conn):
+    run_id = engine.start_run(conn, "ORD-1001", faults(fetch_customer=["fatal"]))
+    assert "effects_committed" not in events(conn, run_id, "run_failed")[0].payload
+
+
 def test_refund_retry_after_approval_does_not_regate(conn):
     run_id = engine.start_run(conn, "ORD-2002", faults(issue_refund=["retryable", "retryable_after_commit"]))
     assert status(conn, run_id) == "awaiting_approval"

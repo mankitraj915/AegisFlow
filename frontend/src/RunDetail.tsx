@@ -232,7 +232,17 @@ function Outcome({ run, events, unknownEvent }: { run: Detail; events: RunEvent[
       : <>All steps succeeded. The ledger holds {run.refunds.length} entries for this run.</>;
   } else if (run.status === "failed") {
     tone = "fail";
-    text = <>{run.error}</>;
+    const committed = events.find((e) => e.type === "run_failed")?.payload.effects_committed as string[] | undefined;
+    text = (
+      <>
+        {run.error}
+        {committed && (
+          <span className="outcome-detail">
+            An earlier step had already taken effect and was not undone: {committed.map((k) => <code key={k}>{k}</code>)}
+          </span>
+        )}
+      </>
+    );
   } else if (run.status === "rejected") {
     tone = "fail";
     const rejected = events.find((e) => e.type === "approval_rejected");

@@ -286,8 +286,16 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
 
 
 def _fail(conn, run_id: str, epoch: int, idx: int, name: str, error: str, info: dict) -> str:
-    """Terminal step failure: fails the step and the run; no later step runs."""
+    """Terminal step failure: fails the step and the run; no later step runs.
+    Failing doesn't undo earlier steps, so name any effects that already happened."""
     with _fenced_tx(conn, run_id, epoch):
+        committed = [
+            r["idempotency_key"] for r in conn.execute(
+                "SELECT name, idempotency_key FROM steps WHERE run_id=? AND status='succeeded' ORDER BY idx", (run_id,)
+            ) if r["name"] in tools.SIDE_EFFECTING
+        ]
+        if committed:
+            info = {**info, "effects_committed": committed}
         conn.execute(
             "UPDATE steps SET status='failed', error=?, finished_at=? WHERE run_id=? AND idx=?",
             (error, now(), run_id, idx),
