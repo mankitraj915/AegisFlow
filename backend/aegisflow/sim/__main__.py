@@ -1,10 +1,11 @@
-"""python -m aegisflow.sim: run seeds, replay one, or survey what a range finds."""
+"""python -m aegisflow.sim: run seeds, replay one, survey a range, or run the negative controls."""
 import argparse
 import sys
 import time
 from collections import Counter
 
 from .checker import INVARIANTS
+from .mutations import MUTATIONS, applied
 from .run import Result, shrink, simulate
 from .workload import FEATURES
 
@@ -54,7 +55,8 @@ def cmd_run(args) -> int:
 
 
 def cmd_replay(args) -> int:
-    result = simulate(args.seed, _features(args.only), keep_trace=args.trace)
+    with applied(args.mutation):
+        result = simulate(args.seed, _features(args.only), keep_trace=args.trace)
     if args.trace and result.trace:
         print("\n".join(result.trace))
     print(f"seed {result.seed}: digest {result.digest}, {result.steps} steps, faults {dict(result.stats)}")
@@ -86,6 +88,34 @@ def cmd_survey(args) -> int:
     return 1 if first else 0
 
 
+def cmd_controls(args) -> int:
+    """Put each known bug back and count the seeds until the checker catches it."""
+    names = args.name or list(MUTATIONS)
+    missed = 0
+    print(f"{'control':32} {'caught by':34} {'seeds':>6} {'seconds':>8}")
+    for name in names:
+        mutation = MUTATIONS[name]
+        started = time.perf_counter()
+        caught = None
+        other: set[str] = set()
+        with applied(name):
+            for seed in range(args.start, args.start + args.max_seeds):
+                found = simulate(seed).invariants()
+                hits = found & set(mutation.catches)
+                other |= found - hits
+                if hits:
+                    caught = (sorted(hits)[0], seed - args.start + 1)
+                    break
+        elapsed = time.perf_counter() - started
+        if caught:
+            print(f"{name:32} {caught[0]:34} {caught[1]:>6} {elapsed:>8.1f}", flush=True)
+        else:
+            missed += 1
+            detail = f"NOT CAUGHT in {args.max_seeds}"
+            print(f"{name:32} {detail:34} {'-':>6} {elapsed:>8.1f}  other: {sorted(other)}", flush=True)
+    return 1 if missed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m aegisflow.sim")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -101,12 +131,19 @@ def main(argv: list[str] | None = None) -> int:
     replay.add_argument("--seed", type=int, required=True)
     replay.add_argument("--only", help="comma-separated features to enable, instead of the seed's own")
     replay.add_argument("--trace", action="store_true", help="print every scheduling step")
+    replay.add_argument("--mutation", choices=sorted(MUTATIONS), help="with this negative control applied")
     replay.set_defaults(fn=cmd_replay)
 
     survey = commands.add_parser("survey", help="report how many seeds each invariant takes to break")
     survey.add_argument("--seeds", type=int, default=1000)
     survey.add_argument("--start", type=int, default=0)
     survey.set_defaults(fn=cmd_survey)
+
+    controls = commands.add_parser("controls", help="reintroduce known bugs and count the seeds to catch each")
+    controls.add_argument("--name", action="append", choices=sorted(MUTATIONS), help="only this control (repeatable)")
+    controls.add_argument("--max-seeds", type=int, default=2000)
+    controls.add_argument("--start", type=int, default=0)
+    controls.set_defaults(fn=cmd_controls)
 
     args = parser.parse_args(argv)
     return args.fn(args)

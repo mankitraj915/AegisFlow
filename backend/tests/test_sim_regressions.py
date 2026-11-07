@@ -1,0 +1,72 @@
+"""Every bug the simulator has found stays found.
+
+Each entry names a seed that catches the bug with it put back. Seeds are pinned
+to the current workload generator; if that changes, `python -m aegisflow.sim
+controls` prints the new ones. docs/BUGS_FOUND.md has the write-ups.
+"""
+import pytest
+
+from aegisflow import db
+from aegisflow.sim.mutations import CHECKER_MISTAKES, MUTATIONS, applied
+from aegisflow.sim.run import simulate
+
+# (control, seed, invariant it breaks)
+ENGINE_BUGS = [
+    ("lose_outcome_unknown", 285, "undisclosed_effect_on_failed_step"),  # P1
+    ("no_fencing", 268, "history_mismatch"),  # P2
+    ("no_order_cap", 8, "refund_cap"),  # P3
+    ("ignore_request_key", 14, "request_ran_twice"),  # P3
+    ("volatile_backoff", 2989, "backoff_skipped"),  # P4
+    ("write_on_connect", 2, "read_path_writes"),  # P5
+    ("notify_ignores_key", 19, "notified_twice"),  # P6
+    ("hide_committed_effects", 5, "undisclosed_effect_before_failure"),  # P7
+]
+
+# The bug classes the design has to rule out.
+CLASSES = [
+    ("skip_idempotency_check", 108, "undisclosed_effect_on_failed_step"),
+    ("skip_idempotency_check_and_cap", 8, "refund_cap"),
+    ("record_progress_first", 8, "succeeded_without_effect"),
+    ("drop_fsync", 12, "ack_lost"),
+]
+
+
+@pytest.mark.parametrize("control,seed,invariant", ENGINE_BUGS + CLASSES)
+def test_seed_passes_fixed_and_fails_with_the_bug_back(control, seed, invariant):
+    assert simulate(seed).failures() == []
+    with applied(control):
+        assert invariant in simulate(seed).invariants()
+
+
+# Where each audit bug was first rediscovered, at commit 005e746. The workload has
+# changed since, so these are now just more seeds that must stay clean.
+@pytest.mark.parametrize("seed", [2, 3, 6, 13, 14, 256, 551, 1545, 2951])
+def test_discovery_seeds_stay_clean(seed):
+    assert simulate(seed).failures() == []
+
+
+def test_a_range_of_seeds_is_clean():
+    for seed in range(100):
+        assert simulate(seed).failures() == [], f"python -m aegisflow.sim replay --seed {seed}"
+
+
+@pytest.mark.parametrize("mutation", list(MUTATIONS.values()) + list(CHECKER_MISTAKES.values()), ids=lambda m: m.name)
+def test_every_control_still_applies_and_restores(mutation):
+    before = (db.SYNCHRONOUS, db._migrate, db.ensure_schema)
+    with applied(mutation.name):
+        pass
+    assert (db.SYNCHRONOUS, db._migrate, db.ensure_schema) == before
+
+
+def test_a_control_whose_target_changed_is_an_error(monkeypatch):
+    broken = MUTATIONS["drop_fsync"].__class__("broken", "", (), (("aegisflow.db", "no such text", "x"),))
+    monkeypatch.setitem(MUTATIONS, "broken", broken)
+    with pytest.raises(ValueError, match="expected one match"):
+        with applied("broken"):
+            pass
+
+
+def test_fsync_control_really_changes_the_setting():
+    with applied("drop_fsync"):
+        assert db.SYNCHRONOUS == "OFF"
+    assert db.SYNCHRONOUS == "FULL"
