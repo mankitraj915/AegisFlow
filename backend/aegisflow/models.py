@@ -27,7 +27,7 @@ class Scenario(BaseModel):
 
 class CreateRun(BaseModel):
     order_id: str = Field(max_length=64)
-    scenario: Scenario = Field(default_factory=Scenario)
+    scenario: Scenario = Field(default_factory=lambda: Scenario())
 
 
 class Decision(BaseModel):

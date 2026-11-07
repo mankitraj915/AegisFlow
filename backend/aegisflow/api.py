@@ -30,11 +30,11 @@ def create_app(db_path: str | None = None, max_runs: int | None = None) -> FastA
         try:
             return fn(*args)
         except engine.RunNotFound:
-            raise HTTPException(404, "run not found")
+            raise HTTPException(404, "run not found") from None
         except engine.OrderNotFound:
-            raise HTTPException(404, "order not found")
+            raise HTTPException(404, "order not found") from None
         except engine.Conflict as exc:
-            raise HTTPException(409, str(exc))
+            raise HTTPException(409, str(exc)) from None
 
     @app.get("/health")
     def health(conn=Depends(get_conn)):

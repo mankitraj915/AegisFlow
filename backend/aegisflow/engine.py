@@ -389,7 +389,8 @@ def get_run_detail(conn, run_id: str) -> RunDetail:
         StepOut(
             idx=r["idx"], name=r["name"], status=r["status"], input=json.loads(r["input_json"]),
             output=json.loads(r["output_json"]) if r["output_json"] else None, error=r["error"],
-            attempt=r["attempt"], idempotency_key=r["idempotency_key"], started_at=r["started_at"], finished_at=r["finished_at"],
+            attempt=r["attempt"], idempotency_key=r["idempotency_key"], started_at=r["started_at"],
+            finished_at=r["finished_at"],
         )
         for r in conn.execute("SELECT * FROM steps WHERE run_id=? ORDER BY idx", (run_id,))
     ]
