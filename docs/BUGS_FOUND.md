@@ -30,3 +30,7 @@ Run at commit `005e746`, before any fix, with `python -m aegisflow.sim survey --
 To replay any of these, check out `005e746` and run `python -m aegisflow.sim replay --seed <seed> --trace`.
 
 **A gap in the rediscovery of P2.** The audit probe showed a *finished run* flipping from `succeeded` to `failed`. The `terminal_changed` invariant watches for that and did not fire in these 6,000 seeds. The seeds above show the same root cause through a step regressing and through two terminal events on one run, but not that exact symptom.
+
+## Deeper survey at the discovery commit
+
+`survey --seeds 14000 --start 6000` at `005e746`, 1,012.5 s. `terminal_changed`, the exact P2 flip, did fire: first at seed 13007, once in those 14,000 seeds. `illegal_transition` also fired once, at seed 13817.
