@@ -33,8 +33,8 @@ export const STEP_INFO: Record<string, { title: string; does: string }> = {
 export type Tone = "ok" | "run" | "gate" | "cut" | "fail" | "unknown" | "idle";
 
 // Run statuses, plus two derived from events rather than the backend status:
-// "outcome_unknown", a failed run whose side-effecting step ran out of retries
-// after its effect may have committed, and "interrupted", a running run
+// "outcome_unknown", a failed run whose side-effecting step failed when its
+// effect may have committed, and "interrupted", a running run
 // stopped by a simulated interruption that has not been resumed.
 const RUN_STATUS: Record<string, { label: string; tone: Tone }> = {
   running: { label: "Running", tone: "run" },

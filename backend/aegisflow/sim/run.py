@@ -1,5 +1,7 @@
 """Run one seed: same seed, same bytes."""
+import atexit
 import os
+import shutil
 import tempfile
 import threading
 from collections import Counter
@@ -18,6 +20,7 @@ def _path(seed: int) -> str:
     global _workdir
     if _workdir is None:
         _workdir = tempfile.mkdtemp(prefix="aegisflow-sim-")
+        atexit.register(shutil.rmtree, _workdir, ignore_errors=True)
     return os.path.join(_workdir, f"seed-{seed}.db")
 
 
