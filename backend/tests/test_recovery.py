@@ -145,7 +145,9 @@ def test_interrupted_flag_follows_persisted_events(conn):
 
     plain = engine.start_run(conn, "ORD-1001", Scenario())
     run_id = engine.start_run(conn, "ORD-1001", INTERRUPT_REFUND)
-    flags = lambda: {r.id: (r.status, r.interrupted) for r in engine.list_runs(conn)}
+    def flags():
+        return {r.id: (r.status, r.interrupted) for r in engine.list_runs(conn)}
+
     assert flags() == {plain: ("succeeded", False), run_id: ("running", True)}
     assert engine.get_run(conn, run_id).interrupted and engine.get_run_detail(conn, run_id).interrupted
 

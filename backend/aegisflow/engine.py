@@ -33,7 +33,13 @@ from datetime import UTC, datetime, timedelta
 from . import planner, tools
 from .db import now, tx
 from .models import (
-    ApprovalOut, EventOut, RefundOut, RunDetail, RunOut, Scenario, StepOut,
+    ApprovalOut,
+    EventOut,
+    RefundOut,
+    RunDetail,
+    RunOut,
+    Scenario,
+    StepOut,
 )
 
 # Test seam: called as hook(point, step_name) at named crash windows.
@@ -332,6 +338,7 @@ def _decide(conn, run_id: str, decision: str, decided_by: str, reason: str | Non
 
 def approve(conn, run_id: str, decided_by: str, hook: Hook | None = None) -> str:
     token = _decide(conn, run_id, "approved", decided_by, None)
+    assert token is not None
     return _drive(conn, run_id, token, hook)
 
 

@@ -10,7 +10,7 @@ FaultKind = Literal["retryable", "fatal", "retryable_after_commit", "interrupt_a
 
 
 class Scenario(BaseModel):
-    approval_threshold_paise: int = Field(DEFAULT_APPROVAL_THRESHOLD_PAISE, ge=0)
+    approval_threshold_paise: int = Field(default=DEFAULT_APPROVAL_THRESHOLD_PAISE, ge=0)
     require_manual_review: bool = False
     # Deterministic fault injection: step name -> outcome of attempts 1..n.
     # Attempts beyond the list run normally.
