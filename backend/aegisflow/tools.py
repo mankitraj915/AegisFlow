@@ -1,9 +1,9 @@
 """Deterministic mock tools. Money is integer paise everywhere.
 
 Each tool is fn(conn, idempotency_key, state) -> output dict. Fatal failures
-raise ToolError; transient ones raise RetryableToolError. issue_refund is the
-only side-effecting tool; it writes to the mock payment ledger in its own
-committed transaction, like an external system would.
+raise ToolError; transient ones raise RetryableToolError. issue_refund and notify_customer have side effects;
+they write to the mock external system in its own committed transaction, keyed so
+that a repeated call changes nothing, like a real provider's idempotency keys.
 
 The engine invokes tools through call(), which applies the scenario's
 deterministic fault plan for the given attempt.
@@ -25,7 +25,7 @@ class RetryableToolError(Exception):
 
 
 # Tools whose effects may have committed even when they raise.
-SIDE_EFFECTING = {"issue_refund"}
+SIDE_EFFECTING = {"issue_refund", "notify_customer"}
 
 
 ORDERS = {
@@ -106,6 +106,15 @@ class SqlLedger:
                     f"refusing {order_id}/{amount}"
                 )
 
+    def send_message(self, key: str, to: str, message: str) -> bool:
+        """Deliver a message, once per key. Returns whether this call delivered it."""
+        with tx(self.conn):
+            return self.conn.execute(
+                "INSERT OR IGNORE INTO notifications(idempotency_key, recipient, message, created_at) "
+                "VALUES (?,?,?,?)",
+                (key, to, message, now()),
+            ).rowcount == 1
+
 
 def _ledger(conn):
     make = runtime.current.ledger
@@ -123,7 +132,7 @@ def notify_customer(conn, key, state):
     customer = state["outputs"]["fetch_customer"]
     refund = state["outputs"]["issue_refund"]
     message = f"Your refund of {refund['amount_paise']} paise for {refund['order_id']} has been issued."
-    runtime.current.send_message(customer["email"], message)
+    _ledger(conn).send_message(key, customer["email"], message)
     return {"channel": "email", "to": customer["email"], "message": message}
 
 

@@ -40,10 +40,8 @@ class Runtime:
     open_db: Callable[[str], Any] = _open_db
     # Wraps each tool call: invoke(tool name, idempotency key, call the tool).
     invoke: Callable[[str, str, Callable[[], dict]], dict] = _invoke
-    # Where refunds go, given the engine's connection. None: that same database.
+    # The external system, given the engine's connection. None: that same database.
     ledger: Callable[[Any], Any] | None = None
-    # Delivers a customer message. Nothing is sent in production: this is a mock.
-    send_message: Callable[[str, str], None] = lambda to, message: None
 
 
 current = Runtime()

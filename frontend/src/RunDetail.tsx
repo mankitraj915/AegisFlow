@@ -219,7 +219,7 @@ function Outcome({ run, events, unknownEvent }: { run: Detail; events: RunEvent[
     tone = "unknown";
     text = (
       <>
-        The refund step ran out of retries after the ledger write may have committed. Check the ledger for key{" "}
+        A step stopped after its effect may have taken place: it ran out of retries or was refused on a retry. Check the external system for key{" "}
         {keyed(String(unknownEvent.payload.idempotency_key))} before taking further action.
         <span className="outcome-detail">{run.error}</span>
       </>

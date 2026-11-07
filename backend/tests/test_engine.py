@@ -141,6 +141,25 @@ def test_crash_window_resume_creates_no_second_refund(conn):
     assert final[4]["idempotency_key"] == key and final[4]["status"] == "succeeded"
 
 
+def test_crash_after_notify_delivers_one_message(conn):
+    def crash_after_notify(point, name):
+        if point == "after_tool" and name == "notify_customer":
+            raise RuntimeError("simulated crash")
+
+    with pytest.raises(RuntimeError):
+        engine.start_run(conn, "ORD-1001", Scenario(), hook=crash_after_notify)
+    run_id = conn.execute("SELECT id FROM runs").fetchone()["id"]
+    assert engine.advance(conn, run_id) == "succeeded"
+    assert [r["idempotency_key"] for r in conn.execute("SELECT * FROM notifications")] == [f"{run_id}:5"]
+
+
+def test_message_provider_delivers_once_per_key(conn):
+    provider = tools.SqlLedger(conn)
+    assert provider.send_message("k", "a@example.test", "hello") is True
+    assert provider.send_message("k", "a@example.test", "hello") is False
+    assert conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 1
+
+
 def test_crash_right_after_approval_is_recoverable(conn):
     run_id = engine.start_run(conn, "ORD-2002", Scenario())
     with pytest.raises(RuntimeError):

@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from . import runtime
 
 SYNCHRONOUS = "FULL"
-SCHEMA_VERSION = 3 # Raise whenever _migrate gains a step.
+SCHEMA_VERSION = 4 # Raise whenever _migrate gains a step.
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -67,6 +67,13 @@ CREATE TABLE IF NOT EXISTS refunds (
     idempotency_key TEXT PRIMARY KEY,
     order_id        TEXT NOT NULL,
     amount_paise    INTEGER NOT NULL CHECK (amount_paise > 0),
+    created_at      TEXT NOT NULL
+);
+-- Mock message provider: one delivery per key. Nothing is actually sent.
+CREATE TABLE IF NOT EXISTS notifications (
+    idempotency_key TEXT PRIMARY KEY,
+    recipient       TEXT NOT NULL,
+    message         TEXT NOT NULL,
     created_at      TEXT NOT NULL
 );
 """

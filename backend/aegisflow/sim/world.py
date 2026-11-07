@@ -16,6 +16,20 @@ OPERATOR_ROUNDS = 12
 EXPECTED_ERRORS = (engine.Conflict, engine.RunNotFound, engine.OrderNotFound)
 
 
+class _Provider(tools.SqlLedger):
+    """The external system, counting what it really delivers."""
+
+    def __init__(self, conn: sqlite3.Connection, deliveries: Counter):
+        super().__init__(conn)
+        self.deliveries = deliveries
+
+    def send_message(self, key: str, to: str, message: str) -> bool:
+        delivered = super().send_message(key, to, message)
+        if delivered:
+            self.deliveries[key] += 1
+        return delivered
+
+
 class World:
     def __init__(self, seed: int, plan: Plan, path: str, keep_trace: bool = False):
         self.seed, self.plan, self.path = seed, plan, path
@@ -29,11 +43,10 @@ class World:
         self.stats: Counter = Counter()
         self.observers: list = []
         self.deliveries: Counter = Counter()
-        self._invoking_key = ""
         self.keeper = raw_connect(path)  # Holds the WAL open: no last-close checkpoint.
         self.keeper.execute("PRAGMA journal_mode=WAL")
         self.external = self._open_external()
-        self.ledger = tools.SqlLedger(self.external)
+        self.ledger = _Provider(self.external, self.deliveries)
 
     @staticmethod
     def _open_external() -> sqlite3.Connection:
@@ -51,7 +64,6 @@ class World:
             open_db=self._open_db,
             invoke=self._invoke,
             ledger=lambda conn: self.ledger,
-            send_message=self._send_message,
         )
 
     def on(self, fault: str) -> bool:
@@ -123,30 +135,26 @@ class World:
             raise tools.ToolError("simulated: gateway refused the call")
         if self.on("tool_late_delivery"):
             delay = self._values.randrange(1_000, 90_000_000)
-            sched.spawn(f"net-{key}", lambda: self._deliver_late(key, call), delay, daemon=True)
+            sched.spawn(f"net-{key}", lambda: self._deliver_late(call), delay, daemon=True)
             raise tools.RetryableToolError("simulated: timed out, request still in flight")
-        output = self._apply(key, call)
+        output = self._apply(call)
         if self.on("tool_duplicate"):
-            self._apply(key, call)
+            self._apply(call)
         sched.step(f"tool-done {name}")
         if self.on("tool_drop_response"):
             raise tools.RetryableToolError("simulated: response lost")
         return output
 
-    def _apply(self, key: str, call) -> dict:
-        self._invoking_key = key
+    def _apply(self, call) -> dict:
         output = call()
         self._notify("external_changed")
         return output
 
-    def _deliver_late(self, key: str, call) -> None:
+    def _deliver_late(self, call) -> None:
         try:
-            self._apply(key, call)
+            self._apply(call)
         except tools.ToolError:
             pass  # The caller gave up long ago; nobody hears the refusal.
-
-    def _send_message(self, to: str, message: str) -> None:
-        self.deliveries[self._invoking_key] += 1
 
     # ---- clients ----
 
