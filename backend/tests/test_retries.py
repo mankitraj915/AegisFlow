@@ -159,6 +159,32 @@ def test_exhaustion_after_refund_commit_marks_outcome_unknown(conn):
     assert len(refunds(conn)) == 1 and len(steps(conn, run_id)) == 5
 
 
+def test_fatal_error_after_refund_commit_marks_outcome_unknown(conn):
+    run_id = engine.start_run(conn, "ORD-1001", faults(issue_refund=["retryable_after_commit", "fatal"]))
+    assert status(conn, run_id) == "failed"
+    key = step(conn, run_id, "issue_refund")["idempotency_key"]
+    for type_ in ("step_failed", "run_failed"):
+        payload = events(conn, run_id, type_)[0].payload
+        assert payload["outcome_unknown"] is True and payload["idempotency_key"] == key
+        assert payload["retryable"] is False
+    assert [r["idempotency_key"] for r in refunds(conn)] == [key]
+
+
+def test_fatal_error_on_resume_after_a_crash_marks_outcome_unknown(conn):
+    def crash_then_refuse(point, name):
+        if point == "after_tool" and name == "issue_refund":
+            raise RuntimeError("simulated crash")
+
+    with pytest.raises(RuntimeError):
+        engine.start_run(conn, "ORD-1001", Scenario(), hook=crash_then_refuse)
+    run_id = only_run(conn)
+    conn.execute("UPDATE runs SET scenario_json=? WHERE id=?",
+                 (faults(issue_refund=["fatal"]).model_dump_json(), run_id))
+    assert engine.advance(conn, run_id) == "failed"
+    assert events(conn, run_id, "run_failed")[0].payload["outcome_unknown"] is True
+    assert len(refunds(conn)) == 1
+
+
 def test_refund_retry_after_approval_does_not_regate(conn):
     run_id = engine.start_run(conn, "ORD-2002", faults(issue_refund=["retryable", "retryable_after_commit"]))
     assert status(conn, run_id) == "awaiting_approval"

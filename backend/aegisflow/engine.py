@@ -249,13 +249,17 @@ def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
                     hook("retry_scheduled", name)
                 runtime.current.sleep(delay)  # Outside tx(): never hold the write lock while waiting.
                 continue
-            info = {"attempt": attempt, "retryable": True, "exhausted": True}
+            info: dict = {"attempt": attempt, "retryable": True, "exhausted": True}
             if name in tools.SIDE_EFFECTING:
                 # The effect may have committed before the failure; the key finds it.
                 info |= {"idempotency_key": key, "outcome_unknown": True}
             return _fail(conn, run_id, epoch, idx, name, f"retries exhausted after {attempt} attempts: {exc}", info)
         except tools.ToolError as exc:
-            return _fail(conn, run_id, epoch, idx, name, str(exc), {"attempt": attempt, "retryable": False})
+            info = {"attempt": attempt, "retryable": False}
+            if name in tools.SIDE_EFFECTING and pending is not None:
+                # An earlier execution of this step may have committed, or may still arrive.
+                info |= {"idempotency_key": key, "outcome_unknown": True}
+            return _fail(conn, run_id, epoch, idx, name, str(exc), info)
 
         if hook:
             hook("after_tool", name)
