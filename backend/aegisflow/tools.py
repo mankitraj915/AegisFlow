@@ -64,7 +64,7 @@ def propose_refund(conn, key, state):
     return {
         "order_id": order["order_id"],
         "amount_paise": policy["refundable_paise"],
-        "reason": "customer-requested full refund",
+        "reason": "customer-requested refund of the remaining amount",
     }
 
 

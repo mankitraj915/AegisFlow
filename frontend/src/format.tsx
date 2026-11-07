@@ -24,8 +24,8 @@ export function Ident({ children }: { children: string }) {
 export const STEP_INFO: Record<string, { title: string; does: string }> = {
   fetch_order: { title: "Fetch order", does: "Loads the order from the mock order data." },
   fetch_customer: { title: "Fetch customer", does: "Looks up the order's customer." },
-  check_refund_policy: { title: "Check policy", does: "Only delivered orders are refundable." },
-  propose_refund: { title: "Propose refund", does: "Proposes a full refund of the order total." },
+  check_refund_policy: { title: "Check policy", does: "Delivered orders with something left to refund pass." },
+  propose_refund: { title: "Propose refund", does: "Proposes refunding the remaining refundable amount." },
   issue_refund: { title: "Issue refund", does: "Writes the refund to the simulated payment ledger." },
   notify_customer: { title: "Notify customer", does: "Composes the customer email. Nothing is sent." },
 };
