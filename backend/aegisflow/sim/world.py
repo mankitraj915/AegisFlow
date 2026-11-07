@@ -8,6 +8,7 @@ from functools import partial
 
 from .. import db, engine, recovery, runtime, tools
 from ..models import Scenario
+from . import asgi
 from .scheduler import Killed, Proc, Scheduler
 from .storage import DurableWal, SimConn, raw_connect
 from .workload import Command, Plan
@@ -84,6 +85,7 @@ class World:
         self.ledger = _Provider(self.external, self.deliveries, lambda: self.sched.true_us, retention)
         self.failed_keys: set[str] = set()
         self.poison_kills: Counter = Counter()
+        self.app = asgi.the_app() if "http_layer" in plan.enabled else None
 
     @staticmethod
     def _open_external() -> sqlite3.Connection:
@@ -249,19 +251,75 @@ class World:
         proc.readonly = command.kind == "read"
         conn = None
         try:
-            conn = db.connect(self.path)
-            getattr(self, f"_do_{command.kind}")(conn, command)
+            if self.app is not None and command.kind != "sweep":
+                getattr(self, f"_http_{command.kind}")(command)
+            else:
+                conn = db.connect(self.path)
+                getattr(self, f"_do_{command.kind}")(conn, command)
         except EXPECTED_ERRORS as exc:
             self._notify("replied", proc, command.kind, type(exc).__name__, None)
         except sqlite3.Error as exc:
             self.stats["server_errors"] += 1
             self._notify("server_error", proc, command.kind, exc)
 
+    # ---- the same clients, through the real API ----
+
+    def _http(self, kind: str, method: str, path: str, body: dict | None = None,
+              headers: dict[str, str] | None = None) -> asgi.Reply:
+        reply = asgi.call(self.app, method, path, body, headers)
+        self._notify("api_replied", kind, method, path, reply.status, reply.body)
+        return reply
+
+    def _http_create(self, command: Command) -> None:
+        headers = {"Idempotency-Key": command.request_id} if command.request_id else None
+        reply = self._http("create", "POST", "/runs", {"order_id": command.order_id, "scenario": command.scenario},
+                           headers)
+        if reply.status in (200, 201):
+            run = reply.body
+            if command.request_id:
+                self._notify("request_replied", command.request_id, run["id"])
+                self._notify("request_created", command.request_id, reply.status == 201)
+            self._notify("replied", self.sched.current, "create", run["status"], run["id"])
+
+    def _http_pick(self, statuses: set[str], pick: float) -> str | None:
+        runs = self._http("read", "GET", "/runs").body
+        eligible = [r["id"] for r in runs if r["status"] in statuses]
+        return eligible[int(pick * len(eligible))] if eligible else None
+
+    def _http_operate(self, command: Command) -> None:
+        action = command.action
+        if command.stale:
+            run_id = self._http_pick(ANY_STATUS, command.pick)
+        elif action in ("approve", "reject"):
+            run_id = self._http_pick({"awaiting_approval"}, command.pick)
+        elif action == "reconcile":
+            run_id = self._http_pick({"needs_review"}, command.pick)
+        else:
+            run_id = self._http_pick({"running", "awaiting_approval"}, command.pick)
+        if run_id is None:
+            return
+        body = None
+        if action in ("approve", "reject"):
+            body = {"decided_by": "operator", "reason": "simulated"}
+        # The API has no advance: resuming is how a client continues a run.
+        endpoint = "resume" if action == "advance" else action
+        reply = self._http("operate", "POST", f"/runs/{run_id}/{endpoint}", body)
+        if reply.status == 200:
+            self._notify("replied", self.sched.current, action, reply.body["status"], run_id)
+
+    def _http_read(self, command: Command) -> None:
+        run_id = self._http_pick(ANY_STATUS, command.pick)
+        self._http("read", "GET", "/orders/available")
+        if run_id is not None:
+            self._http("read", "GET", f"/runs/{run_id}")
+            self._http("read", "GET", f"/runs/{run_id}/events")
+
     def _do_create(self, conn, command: Command) -> None:
         run_id = engine.start_run(conn, command.order_id, Scenario(**command.scenario),
-                                 idempotency_key=command.request_id)
+                                  idempotency_key=command.request_id or None)
         run = engine.get_run(conn, run_id)
-        self._notify("request_replied", command.request_id, run_id)
+        if command.request_id:
+            self._notify("request_replied", command.request_id, run_id)
         self._notify("replied", self.sched.current, "create", run.status, run_id)
 
     def _pick_run(self, conn, statuses: set[str], pick: float) -> str | None:

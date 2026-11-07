@@ -15,6 +15,9 @@ MAX_ATTEMPTS = engine.RETRY_POLICY.max_attempts
 POLICY = engine.RetryPolicy()
 TERMINAL = {"succeeded", "failed", "rejected", "quarantined"}
 LEASE_US = engine.LEASE_S * 1_000_000
+# What a client may see. A 5xx from a storage fault arrives as an exception, not a reply,
+# so any 5xx here, or any status not listed, means the API misbehaved on its own.
+API_STATUSES = {"create": {200, 201}, "operate": {200, 404, 409}, "read": {200, 404}}
 LEGAL_RUN_MOVES = {
     "running": {"awaiting_approval", "needs_review", "succeeded", "failed", "quarantined"},
     "awaiting_approval": {"running", "rejected"},
@@ -49,6 +52,7 @@ INVARIANTS = (
     "ledger_mismatch",
     "two_drivers",
     "crash_loop_unbounded",
+    "api_contract",
     "undisclosed_effect_before_failure",
     "request_ran_twice",
     "read_path_writes",
@@ -74,6 +78,7 @@ class Checker:
         self.acks: dict[str, str] = {}
         self.requests: dict[str, set[str]] = defaultdict(set)
         self.lease_read_at: dict[tuple[str, str], int] = {}  # (run, token) -> when it was taken
+        self.creations: Counter = Counter()
 
     def _reset_snapshot(self) -> None:
         self.runs: dict[str, dict] = {}
@@ -218,6 +223,20 @@ class Checker:
         self.requests[request_id].add(run_id)
         if len(self.requests[request_id]) > 1:
             self.fail("request_ran_twice", f"{request_id} ran as {len(self.requests[request_id])} runs")
+
+    def request_created(self, request_id: str, created: bool) -> None:
+        if created:
+            self.creations[request_id] += 1
+            if self.creations[request_id] > 1:
+                self.fail("api_contract", f"{request_id} got 201 Created {self.creations[request_id]} times")
+
+    def api_replied(self, kind: str, method: str, path: str, status: int, body) -> None:
+        if status not in API_STATUSES[kind]:
+            self.fail("api_contract", f"{method} {path} answered {status}: {body}")
+        if isinstance(body, dict):
+            for refund in body.get("refunds", ()):
+                if type(refund["amount_paise"]) is not int:
+                    self.fail("money_not_integer", f"{path} returned {refund['amount_paise']!r}")
 
     def server_error(self, proc: Proc, kind: str, exc: Exception) -> None:
         if "IntegrityError" in type(exc).__name__:

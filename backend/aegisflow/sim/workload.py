@@ -30,10 +30,10 @@ FAULT_RATES: dict[str, tuple[float, float]] = {
 }
 # Workload shapes, switched per seed like faults.
 SHAPES = ("duplicate_commands", "scenario_faults", "readers", "stale_operators", "provider_forgets",
-          "recovery_worker", "poison_step")
+          "recovery_worker", "poison_step", "http_layer")
 # Newer features draw from a stream of their own, so adding one leaves each seed's other draws alone.
 SIDE_FEATURES = ("provider_false_error", "provider_stale_response", "status_unavailable", "provider_forgets",
-                 "recovery_worker", "poison_step")
+                 "recovery_worker", "poison_step", "http_layer")
 FEATURES = tuple(f for f in (*FAULT_RATES, *SHAPES) if f not in SIDE_FEATURES)
 # How long a forgetful provider remembers a key, and how long an outage can age a run.
 RETENTION_S = (310, 700)
@@ -134,5 +134,14 @@ def make_plan(seed: int, only: set[str] | None = None, without: set[str] | froze
         for _ in range(sweeps):
             commands.append(Command("sweep", _when(side)))
     poison = (side.choices(ORDERS, weights)[0], side.choice(planner.PIPELINE))
+    # A held run can be re-checked at any time, including under faults. Settling one by hand
+    # waits until nothing is in flight: a person guessing mid-outage can be wrong in ways no engine can catch.
+    if side.random() < 0.5 and {"status_unavailable", "provider_forgets", "scenario_faults"} & enabled:
+        commands.append(Command("operate", _when(side), action="reconcile", pick=side.random()))
+    if "http_layer" in enabled:
+        keyless = {f"req-{i}" for i in range(4) if side.random() < 0.3}
+        for command in commands:
+            if command.request_id in keyless:
+                command.request_id = ""  # A client that sends no Idempotency-Key.
     return Plan(enabled, rates, stickiness, commands, retention_us, outage_us,
                 poison if "poison_step" in enabled else None)

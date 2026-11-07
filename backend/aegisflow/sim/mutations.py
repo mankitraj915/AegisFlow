@@ -89,6 +89,11 @@ MUTATIONS = {m.name: m for m in (
              ("notified_twice",),
              (("aegisflow.tools", "(key, to, message, now()),",
                '(f"{key}:{runtime.current.new_id()}", to, message, now()),'),)),
+    # The bug the simulator found through the HTTP layer, put back.
+    Mutation("create_reports_conflict", "POST /runs answers 409 for a run it created, if another driver takes it over",
+             ("api_contract",),
+             (("aegisflow.engine", "    except Conflict:\n        pass  # Someone else",
+               "    except ZeroDivisionError:\n        pass  # Someone else"),)),
     # Other claims the checker makes.
     Mutation("no_backoff", "retries fire immediately", ("backoff_skipped",),
              (("aegisflow.engine",
