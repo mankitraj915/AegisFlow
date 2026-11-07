@@ -146,14 +146,13 @@ def test_crash_during_backoff_keeps_retry_budget(conn, sleeps):
 
 
 def test_backoff_survives_a_crash(conn, sleeps, monkeypatch):
+    # The clock stands still, so the whole delay is still owed when the run resumes.
+    monkeypatch.setattr(engine, "now", lambda: "2026-01-01T00:00:00+00:00")
     with pytest.raises(RuntimeError):
         engine.start_run(conn, "ORD-1001", faults(fetch_customer=["retryable"]),
                          hook=crash_at("retry_scheduled", "fetch_customer"))
     run_id = only_run(conn)
     assert sleeps == []  # The crash came before the wait.
-    failed = events(conn, run_id, "step_attempt_failed")[0]
-    # Resume exactly when the failure happened: the whole delay is still owed.
-    monkeypatch.setattr(engine, "now", lambda: failed.ts)
     assert engine.advance(conn, run_id) == "succeeded"
     assert sleeps == [pytest.approx(0.1)]
 
