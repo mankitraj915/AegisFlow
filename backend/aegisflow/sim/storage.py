@@ -149,4 +149,3 @@ class DurableWal:
             with open(self.wal_path, "wb") as out:
                 out.write(wal)
         self.durable = len(wal)
-
