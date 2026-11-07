@@ -7,13 +7,14 @@ import {
 type Loaded = { run: Detail; events: RunEvent[] };
 
 // Where each pipeline step stands, derived from recorded steps, events and the run status.
-type StationState = "done" | "active" | "interrupted" | "failed" | "unknown" | "gate" | "rejected" | "pending" | "skipped";
+type StationState = "done" | "active" | "interrupted" | "failed" | "quarantined" | "unknown" | "gate" | "rejected" | "pending" | "skipped";
 
 const STATION_LABEL: Record<StationState, string> = {
   done: "Succeeded",
   active: "In progress",
   interrupted: "Interrupted",
   failed: "Failed",
+  quarantined: "Quarantined",
   unknown: "Outcome unknown",
   gate: "Awaiting approval",
   rejected: "Not run · rejected",
@@ -30,7 +31,7 @@ interface Station {
 }
 
 function stationsOf(run: Detail, events: RunEvent[]): Station[] {
-  const stopped = run.status === "failed" || run.status === "rejected";
+  const stopped = run.status === "failed" || run.status === "rejected" || run.status === "quarantined";
   return PIPELINE.map((name, idx) => {
     const step = run.steps[idx];
     let state: StationState;
@@ -38,6 +39,7 @@ function stationsOf(run: Detail, events: RunEvent[]): Station[] {
       if (step.status === "succeeded") state = "done";
       else if (step.status === "failed") state = "failed";
       else if (run.status === "needs_review") state = "unknown";
+      else if (run.status === "quarantined") state = "quarantined";
       else state = run.interrupted ? "interrupted" : "active";
     } else if (idx === run.steps.length && run.status === "awaiting_approval") state = "gate";
     else if (idx === run.steps.length && run.status === "rejected") state = "rejected";
@@ -225,6 +227,16 @@ function Outcome({ run, events }: { run: Detail; events: RunEvent[] }) {
       <>
         Nobody can yet say whether this step took effect, so the run is held rather than reported as failed. Nothing further
         happens until it is settled. Check the external system for key {keyed(String(held?.idempotency_key))}.
+        <span className="outcome-detail">{run.error}</span>
+      </>
+    );
+  } else if (run.status === "quarantined") {
+    const held = events.find((e) => e.type === "run_quarantined")?.payload;
+    tone = "fail";
+    text = (
+      <>
+        This step stopped its driver too many times, so nothing will resume it. Its history is kept for whoever investigates.
+        {held?.outcome_unknown === true && <> Whether it took effect is unknown: check the external system for key {keyed(String(held.idempotency_key))}.</>}
         <span className="outcome-detail">{run.error}</span>
       </>
     );
@@ -537,7 +549,8 @@ function ApprovalPanel({ runId, approval, onDecided }: { runId: string; approval
 }
 
 function tone(e: RunEvent): Tone {
-  if (e.type === "run_failed" || e.type === "step_failed" || e.type === "run_rejected") return "fail";
+  if (e.type === "run_failed" || e.type === "step_failed" || e.type === "run_rejected" || e.type === "run_quarantined") return "fail";
+  if (e.type === "step_crashed") return "cut";
   if (e.type === "step_attempt_failed" || e.type === "approval_requested") return "gate";
   if (e.type === "run_interrupted") return "cut";
   if (e.type === "run_needs_review") return "unknown";
@@ -556,6 +569,9 @@ function summarize(e: RunEvent): string {
     case "step_attempt_failed": return `${step}${attempt} failed, retrying in ${p.next_delay_s}s: ${p.error}`;
     case "step_failed": return `${step}${attempt}: ${p.error}`;
     case "run_failed": return String(p.error);
+    case "step_crashed": return `${step}: a driver stopped with no outcome (${p.crashes} so far)`;
+    case "run_recovered": return p.name === undefined ? "Picked up by the recovery worker" : `Recovery worker picked up ${step}`;
+    case "run_quarantined": return `Stopped at ${step} after ${p.crashes} crashes`;
     case "step_reconciled": return `${step}: provider shows the effect under ${p.idempotency_key}${p.reported_error ? `, despite "${p.reported_error}"` : ""}`;
     case "run_needs_review": return `Held at ${step}: ${p.reason}`;
     case "run_review_cleared": return `Settled by ${p.by}: ${p.name} took effect`;

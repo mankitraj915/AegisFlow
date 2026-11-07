@@ -1,7 +1,7 @@
 // Typed client for the backend HTTP API (backend/aegisflow/api.py, models.py).
 // Requests go to /api, which the Vite dev/preview server proxies to the backend.
 
-export type RunStatus = "running" | "succeeded" | "failed" | "awaiting_approval" | "rejected" | "needs_review";
+export type RunStatus = "running" | "succeeded" | "failed" | "awaiting_approval" | "rejected" | "needs_review" | "quarantined";
 export type FaultKind = "retryable" | "fatal" | "retryable_after_commit" | "interrupt_after_commit";
 
 // Mirrors planner.PIPELINE; the backend rejects fault plans for other step names.
@@ -40,6 +40,7 @@ export interface Step {
   output: Record<string, unknown> | null;
   error: string | null;
   attempt: number;
+  crashes: number;
   idempotency_key: string;
   started_at: string;
   finished_at: string | null;

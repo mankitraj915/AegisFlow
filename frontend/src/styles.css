@@ -355,6 +355,7 @@ button.station-body:hover { background: color-mix(in srgb, var(--ink) 4%, transp
 .state-failed { --tone: var(--fail); }
 .state-failed .node { border-radius: 0; background: var(--fail); border-color: var(--fail); }
 .state-unknown { --tone: var(--unknown); }
+.state-quarantined { --tone: var(--fail); }
 .state-unknown .node { border-radius: 0; }
 .state-gate { --tone: var(--gate); }
 .state-gate .node { border-radius: 0; width: 6px; left: 13px; height: 18px; top: 12px; background: var(--gate); border-color: var(--gate); }

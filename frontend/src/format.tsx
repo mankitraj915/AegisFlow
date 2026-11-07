@@ -42,6 +42,7 @@ const RUN_STATUS: Record<string, { label: string; tone: Tone }> = {
   awaiting_approval: { label: "Awaiting approval", tone: "gate" },
   rejected: { label: "Rejected", tone: "fail" },
   needs_review: { label: "Needs review", tone: "unknown" },
+  quarantined: { label: "Quarantined", tone: "fail" },
   interrupted: { label: "Interrupted", tone: "cut" },
 };
 
