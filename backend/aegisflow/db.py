@@ -3,6 +3,8 @@ from contextlib import contextmanager
 
 from . import runtime
 
+SYNCHRONOUS = "FULL"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     id            TEXT PRIMARY KEY,
@@ -74,11 +76,12 @@ def now() -> str:
 
 
 def connect(path: str) -> sqlite3.Connection:
-    # isolation_level=None: autocommit; transactions are explicit via tx().
-    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=10)
-    conn.row_factory = sqlite3.Row
+    conn = runtime.current.open_db(path)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
+    # Sync the WAL on every commit, so a commit survives power loss. SQLite's
+    # usual default, stated here because the durability claims depend on it.
+    conn.execute(f"PRAGMA synchronous={SYNCHRONOUS}")
     conn.executescript(SCHEMA)
     _migrate(conn)
     return conn
