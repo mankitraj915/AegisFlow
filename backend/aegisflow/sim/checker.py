@@ -62,7 +62,8 @@ class Checker:
         self.seen: Counter = Counter()
         self._reset_snapshot()
         self.claim_count: Counter = Counter()
-        self.failed_attempts: dict[str, list[tuple[int, int, int]]] = defaultdict(list)
+        self.failed_attempts: dict[str, list[tuple[int, int, int, int]]] = defaultdict(list)
+        self.attempt_began: dict[str, int] = {}
         self.succeeded_at: dict[str, int] = {}
         self.forward_jumps: list[int] = []
         self.last_skew = 0
@@ -161,14 +162,19 @@ class Checker:
                     self.succeeded_at[step_key] = now
                 elif event["type"] == "step_attempt_failed":
                     delay_us = int(payload["next_delay_s"] * 1_000_000)
-                    self.failed_attempts[step_key].append((now, delay_us, payload["attempt"]))
+                    attempt_began = self.attempt_began.get(step_key, now)
+                    self.failed_attempts[step_key].append((attempt_began, now, delay_us, payload["attempt"]))
                     if payload["next_delay_s"] != POLICY.delay(payload["attempt"]):
                         self.fail("wrong_backoff_delay", f"attempt {payload['attempt']}: {payload['next_delay_s']}")
 
     def tool_started(self, proc: Proc, name: str, key: str) -> None:
         now = self.world.sched.true_us
-        for failed_at, delay_us, attempt in self.failed_attempts.get(key, ()):
-            jumped = any(failed_at <= t <= now for t in self.forward_jumps)
+        self.attempt_began[key] = now
+        for attempt_began, failed_at, delay_us, attempt in self.failed_attempts.get(key, ()):
+            # The backoff's end is computed from the clock before the failure commits, so a
+            # jump any time since the attempt began may have shortened it. That's expected
+            # of a wall-clock backoff; a retry with no jump in that span is a real skip.
+            jumped = any(attempt_began <= t <= now for t in self.forward_jumps)
             if now - failed_at < delay_us and not jumped:
                 self.fail("backoff_skipped", f"{name}: retried {now - failed_at} us after attempt {attempt}, "
                           f"wanted {delay_us} us")
