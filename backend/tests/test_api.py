@@ -122,6 +122,16 @@ def test_key_is_bounded(client):
     assert r.status_code == 422
 
 
+def test_available_orders_move_past_refunded_ones(client):
+    def first_of(kind):
+        return next(o for o in client.get("/orders/available").json() if o["kind"] == kind)
+
+    assert first_of("under_threshold") == {"id": "ORD-1001", "kind": "under_threshold", "remaining_paise": 129_900}
+    assert client.post("/runs", json={"order_id": "ORD-1001"}).json()["status"] == "succeeded"
+    assert first_of("under_threshold")["id"] == "ORD-1002"
+    assert first_of("cancelled")["id"] == "ORD-9009"
+
+
 def test_error_contract(client):
     assert client.get("/runs/nope").status_code == 404
     assert client.get("/runs/nope/events").status_code == 404

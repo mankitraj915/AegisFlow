@@ -13,6 +13,7 @@ from collections.abc import Callable
 
 from . import runtime
 from .db import now, tx
+from .demo_data import CUSTOMERS, ORDER_KINDS, ORDERS
 
 
 class ToolError(Exception):
@@ -26,25 +27,6 @@ class RetryableToolError(Exception):
 
 # Tools whose effects may have committed even when they raise.
 SIDE_EFFECTING = {"issue_refund", "notify_customer"}
-
-
-ORDERS = {
-    # Low value, well under the default threshold.
-    "ORD-1001": {"customer_id": "CUST-1", "total_paise": 129_900, "status": "delivered", "manual_review": False},
-    # High value: exceeds the default ₹5,000 threshold.
-    "ORD-2002": {"customer_id": "CUST-2", "total_paise": 1_200_000, "status": "delivered", "manual_review": False},
-    # Low value but flagged for manual review on the order itself.
-    "ORD-3003": {"customer_id": "CUST-1", "total_paise": 49_900, "status": "delivered", "manual_review": True},
-    # Exactly at the threshold: "exceeds" is strict, so no approval.
-    "ORD-4004": {"customer_id": "CUST-2", "total_paise": 500_000, "status": "delivered", "manual_review": False},
-    # Not refundable.
-    "ORD-9009": {"customer_id": "CUST-1", "total_paise": 89_900, "status": "cancelled", "manual_review": False},
-}
-
-CUSTOMERS = {
-    "CUST-1": {"name": "Asha Rao", "email": "asha@example.test"},
-    "CUST-2": {"name": "Vikram Shah", "email": "vikram@example.test"},
-}
 
 
 def order_exists(order_id: str) -> bool:
@@ -70,7 +52,10 @@ def check_refund_policy(conn, key, state):
     order = state["outputs"]["fetch_order"]
     if order["status"] != "delivered":
         raise ToolError(f"order {order['order_id']} is {order['status']}; not refundable")
-    return {"eligible": True, "refundable_paise": order["total_paise"]}
+    remaining = order["total_paise"] - _ledger(conn).refunded_total(order["order_id"])
+    if remaining <= 0:
+        raise ToolError(f"order {order['order_id']} is already fully refunded")
+    return {"eligible": True, "refundable_paise": remaining}
 
 
 def propose_refund(conn, key, state):
@@ -91,20 +76,30 @@ class SqlLedger:
         self.conn = conn
 
     def issue(self, key: str, order_id: str, amount: int) -> None:
-        with tx(self.conn):
-            row = self.conn.execute(
-                "SELECT order_id, amount_paise FROM refunds WHERE idempotency_key=?", (key,)
-            ).fetchone()
-            if row is None:
-                self.conn.execute(
-                    "INSERT INTO refunds(idempotency_key, order_id, amount_paise, created_at) VALUES (?,?,?,?)",
-                    (key, order_id, amount, now()),
-                )
-            elif (row["order_id"], row["amount_paise"]) != (order_id, amount):
-                raise ToolError(
-                    f"idempotency key {key} already used for {row['order_id']}/{row['amount_paise']}, "
-                    f"refusing {order_id}/{amount}"
-                )
+        try:
+            with tx(self.conn):
+                row = self.conn.execute(
+                    "SELECT order_id, amount_paise FROM refunds WHERE idempotency_key=?", (key,)
+                ).fetchone()
+                if row is None:
+                    self.conn.execute(
+                        "INSERT INTO refunds(idempotency_key, order_id, amount_paise, created_at) VALUES (?,?,?,?)",
+                        (key, order_id, amount, now()),
+                    )
+                elif (row["order_id"], row["amount_paise"]) != (order_id, amount):
+                    raise ToolError(
+                        f"idempotency key {key} already used for {row['order_id']}/{row['amount_paise']}, "
+                        f"refusing {order_id}/{amount}"
+                    )
+        except sqlite3.IntegrityError as exc:
+            raise ToolError(f"ledger refused {amount} paise for {order_id}: {exc}") from exc
+
+    def refunded_totals(self) -> dict[str, int]:
+        rows = self.conn.execute("SELECT order_id, SUM(amount_paise) AS total FROM refunds GROUP BY order_id")
+        return {row["order_id"]: row["total"] for row in rows}
+
+    def refunded_total(self, order_id: str) -> int:
+        return self.refunded_totals().get(order_id, 0)
 
     def send_message(self, key: str, to: str, message: str) -> bool:
         """Deliver a message, once per key. Returns whether this call delivered it."""
@@ -119,6 +114,17 @@ class SqlLedger:
 def _ledger(conn):
     make = runtime.current.ledger
     return make(conn) if make else SqlLedger(conn)
+
+
+def available_orders(conn) -> list[dict]:
+    """The first order of each kind with something left to refund."""
+    refunded = _ledger(conn).refunded_totals()
+    found: dict[str, dict] = {}
+    for order_id, kind in ORDER_KINDS.items():
+        remaining = ORDERS[order_id]["total_paise"] - refunded.get(order_id, 0)
+        if kind not in found and remaining > 0:
+            found[kind] = {"id": order_id, "kind": kind, "remaining_paise": remaining}
+    return list(found.values())
 
 
 def issue_refund(conn: sqlite3.Connection, key: str, state) -> dict:

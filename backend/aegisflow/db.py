@@ -1,10 +1,10 @@
 import sqlite3
 from contextlib import contextmanager
 
-from . import runtime
+from . import demo_data, runtime
 
 SYNCHRONOUS = "FULL"
-SCHEMA_VERSION = 5 # Raise whenever _migrate gains a step.
+SCHEMA_VERSION = 6  # Raise whenever _migrate gains a step.
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -69,6 +69,11 @@ CREATE TABLE IF NOT EXISTS refunds (
     amount_paise    INTEGER NOT NULL CHECK (amount_paise > 0),
     created_at      TEXT NOT NULL
 );
+-- What the payment system knows about each order: the most it may ever refund.
+CREATE TABLE IF NOT EXISTS orders (
+    id          TEXT PRIMARY KEY,
+    total_paise INTEGER NOT NULL
+);
 -- Mock message provider: one delivery per key. Nothing is actually sent.
 CREATE TABLE IF NOT EXISTS notifications (
     idempotency_key TEXT PRIMARY KEY,
@@ -124,6 +129,20 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS runs_idempotency_key ON runs(idempotency_key) "
             "WHERE idempotency_key IS NOT NULL"
+        )
+        # Seeded in the transaction that adds the trigger, so nobody sees one without the other.
+        orders = [(order_id, order["total_paise"]) for order_id, order in demo_data.ORDERS.items()]
+        conn.execute(
+            "INSERT OR IGNORE INTO orders(id, total_paise) VALUES " + ",".join("(?,?)" for _ in orders),
+            [value for order in orders for value in order],
+        )
+        # The cap lives in the database so that no code path, and no interleaving
+        # of concurrent runs, can refund an order past its total.
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS refunds_within_order_total BEFORE INSERT ON refunds
+            WHEN COALESCE((SELECT SUM(amount_paise) FROM refunds WHERE order_id = NEW.order_id), 0) + NEW.amount_paise
+                 > COALESCE((SELECT total_paise FROM orders WHERE id = NEW.order_id), 0)
+            BEGIN SELECT RAISE(ABORT, 'refund exceeds order amount'); END"""
         )
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 

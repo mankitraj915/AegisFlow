@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import threading
 
 import pytest
@@ -221,10 +222,76 @@ def test_persistence_across_connections(db_path):
 
 
 def test_deterministic_outputs_across_runs(conn):
-    def outputs(run_id):
-        # Run ids (embedded in idempotency keys / refund ids) are the only permitted difference.
-        return [(s["name"], s["output_json"].replace(run_id, "<run>")) for s in steps(conn, run_id)]
+    def outputs(run_id, order_id):
+        # Run ids (embedded in idempotency keys / refund ids) and the order are the only permitted differences.
+        return [(s["name"], s["output_json"].replace(run_id, "<run>").replace(order_id, "<order>"))
+                for s in steps(conn, run_id)]
 
     a = engine.start_run(conn, "ORD-1001", Scenario())
-    b = engine.start_run(conn, "ORD-1001", Scenario())
-    assert a != b and outputs(a) == outputs(b)
+    b = engine.start_run(conn, "ORD-1002", Scenario())
+    assert a != b and outputs(a, "ORD-1001") == outputs(b, "ORD-1002")
+
+
+def test_refunded_order_cannot_be_refunded_again(conn):
+    first = engine.start_run(conn, "ORD-1001", Scenario())
+    second = engine.start_run(conn, "ORD-1001", Scenario())
+    assert status(conn, first) == "succeeded"
+    run = engine.get_run(conn, second)
+    assert run.status == "failed" and "already fully refunded" in run.error
+    assert [s["name"] for s in steps(conn, second)][-1] == "check_refund_policy"
+    assert [r["idempotency_key"] for r in refunds(conn)] == [f"{first}:4"]
+
+
+def test_runs_racing_for_one_order_refund_it_once(conn):
+    # Both pass the policy check while nothing is refunded yet, then wait for approval.
+    first = engine.start_run(conn, "ORD-2002", Scenario())
+    second = engine.start_run(conn, "ORD-2002", Scenario())
+    engine.approve(conn, first, "a")
+    engine.approve(conn, second, "a")
+    assert status(conn, first) == "succeeded"
+    run = engine.get_run(conn, second)
+    assert run.status == "failed" and "exceeds order amount" in run.error
+    assert sum(r["amount_paise"] for r in refunds(conn)) == 1_200_000
+    failure = [e for e in engine.list_events(conn, second) if e.type == "run_failed"][0].payload
+    assert "outcome_unknown" not in failure  # A refusal is a known outcome: nothing was refunded.
+
+
+def test_database_refuses_any_refund_past_the_order_total(conn):
+    ledger = tools.SqlLedger(conn)
+    ledger.issue("a", "ORD-1001", 100_000)
+    ledger.issue("b", "ORD-1001", 29_900)  # Exactly the total of 129_900.
+    with pytest.raises(tools.ToolError, match="exceeds order amount"):
+        ledger.issue("c", "ORD-1001", 1)
+    ledger.issue("b", "ORD-1001", 29_900)  # A replay inserts nothing, so the cap doesn't refuse it.
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO refunds VALUES ('d', 'ORD-1001', 1, 'now')")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO refunds VALUES ('e', 'NOT-AN-ORDER', 1, 'now')")
+    assert ledger.refunded_total("ORD-1001") == 129_900
+
+
+def test_policy_offers_only_what_is_left(conn):
+    tools.SqlLedger(conn).issue("earlier", "ORD-1001", 100_000)
+    run_id = engine.start_run(conn, "ORD-1001", Scenario())
+    assert status(conn, run_id) == "succeeded"
+    assert [r["amount_paise"] for r in refunds(conn) if r["idempotency_key"] != "earlier"] == [29_900]
+
+
+def test_cap_is_added_to_a_database_from_before_it_existed(db_path):
+    old = connect(db_path)
+    old.execute("DROP TRIGGER refunds_within_order_total")
+    old.execute("DROP TABLE orders")
+    old.execute("INSERT INTO refunds VALUES ('old', 'ORD-1001', 129900, 'then')")
+    old.execute("PRAGMA user_version=5")
+    old.close()
+    upgraded = connect(db_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        upgraded.execute("INSERT INTO refunds VALUES ('new', 'ORD-1001', 1, 'now')")
+    assert engine.get_run(upgraded, engine.start_run(upgraded, "ORD-1001", Scenario())).status == "failed"
+    upgraded.close()
+
+
+def test_demo_pool_lasts_as_long_as_the_run_limit():
+    kinds = list(tools.ORDER_KINDS.values())
+    assert kinds.count("under_threshold") >= 500
+    assert tools.ORDERS["ORD-1001"]["total_paise"] == 129_900 and tools.ORDER_KINDS["ORD-9009"] == "cancelled"

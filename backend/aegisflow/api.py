@@ -5,9 +5,9 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import engine
+from . import engine, tools
 from .db import connect
-from .models import CreateRun, Decision, EventOut, RunDetail, RunOut
+from .models import AvailableOrder, CreateRun, Decision, EventOut, RunDetail, RunOut
 
 # Built frontend, relative to the source tree (backend/aegisflow -> frontend/dist).
 DEFAULT_FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
@@ -41,6 +41,10 @@ def create_app(db_path: str | None = None, max_runs: int | None = None) -> FastA
     def health(conn=Depends(get_conn)):
         conn.execute("SELECT 1")
         return {"status": "ok"}
+
+    @app.get("/orders/available", response_model=list[AvailableOrder])
+    def available_orders(conn=Depends(get_conn)):
+        return tools.available_orders(conn)
 
     @app.post("/runs", response_model=RunOut, status_code=201)
     def create_run(

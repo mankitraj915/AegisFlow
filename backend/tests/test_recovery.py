@@ -215,7 +215,7 @@ def test_interrupted_flag_follows_persisted_events(conn):
             raise RuntimeError("simulated crash")
 
     plain = engine.start_run(conn, "ORD-1001", Scenario())
-    run_id = engine.start_run(conn, "ORD-1001", INTERRUPT_REFUND)
+    run_id = engine.start_run(conn, "ORD-1002", INTERRUPT_REFUND)
     def flags():
         return {r.id: (r.status, r.interrupted) for r in engine.list_runs(conn)}
 

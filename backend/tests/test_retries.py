@@ -245,13 +245,13 @@ def test_refund_retry_after_approval_does_not_regate(conn):
 def test_retries_are_deterministic_across_runs(conn):
     scenario = faults(fetch_order=["retryable"], issue_refund=["retryable_after_commit"])
 
-    def history(run_id):
-        return [(e.type, json.dumps(e.payload, sort_keys=True).replace(run_id, "<run>"))
+    def history(run_id, order_id):
+        return [(e.type, json.dumps(e.payload, sort_keys=True).replace(run_id, "<run>").replace(order_id, "<order>"))
                 for e in events(conn, run_id)]
 
     a = engine.start_run(conn, "ORD-1001", scenario)
-    b = engine.start_run(conn, "ORD-1001", scenario)
-    assert history(a) == history(b)
+    b = engine.start_run(conn, "ORD-1002", scenario)
+    assert history(a, "ORD-1001") == history(b, "ORD-1002")
 
 
 def test_unknown_fault_step_is_rejected():

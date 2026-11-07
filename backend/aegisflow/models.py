@@ -25,6 +25,12 @@ class Scenario(BaseModel):
         return faults
 
 
+class AvailableOrder(BaseModel):
+    id: str
+    kind: str
+    remaining_paise: int
+
+
 class CreateRun(BaseModel):
     order_id: str = Field(max_length=64)
     scenario: Scenario = Field(default_factory=lambda: Scenario())
