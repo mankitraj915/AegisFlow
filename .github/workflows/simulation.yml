@@ -1,0 +1,40 @@
+name: Long simulation
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Seeds to run
+        default: "100000"
+      start:
+        description: First seed (blank picks a range no earlier scheduled run has covered)
+        default: ""
+      budget_seconds:
+        description: Stop starting new seeds after this long
+        default: "19800"
+
+permissions:
+  contents: read
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e .
+      - name: Run seeds
+        env:
+          SEEDS: ${{ inputs.seeds || '100000' }}
+          START: ${{ inputs.start }}
+          BUDGET: ${{ inputs.budget_seconds || '3000' }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: python -m aegisflow.sim run --seeds "$SEEDS" --start "${START:-$((RUN_NUMBER * 1000000))}" --budget-seconds "$BUDGET"
