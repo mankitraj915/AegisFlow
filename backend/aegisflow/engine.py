@@ -187,11 +187,9 @@ def run_id_for_key(conn, idempotency_key: str) -> str | None:
     return row["id"] if row else None
 
 
-def start_run_once(conn, order_id: str, scenario: Scenario, idempotency_key: str | None = None,
-                   hook: Hook | None = None) -> tuple[str, bool]:
-    """Create and drive a run. Returns (run id, whether this call created it): a
-    repeated request with the same key gets the original run back as it stands,
-    without driving it. Reusing a key for a different request is a Conflict."""
+def _create_run(conn, order_id: str, scenario: Scenario, idempotency_key: str | None) -> tuple[str, bool]:
+    """Returns (run id, whether this call created it): a repeated request with the
+    same key gets the original run. Reusing a key for a different request is a Conflict."""
     if not tools.order_exists(order_id):
         raise OrderNotFound(order_id)
     run_id = runtime.current.new_id()
@@ -211,13 +209,30 @@ def start_run_once(conn, order_id: str, scenario: Scenario, idempotency_key: str
             (run_id, order_id, scenario_json, "running", now(), now(), idempotency_key),
         )
         _event(conn, run_id, "run_created", {"order_id": order_id, "scenario": scenario.model_dump()})
-    advance(conn, run_id, hook)
+    return run_id, True
+
+
+def start_run_once(conn, order_id: str, scenario: Scenario, idempotency_key: str | None = None) -> tuple[str, bool]:
+    """Create and drive a run on a client's behalf. A repeat of an earlier request gets
+    that run back as it stands, without driving it. Once the run exists, the request
+    has succeeded: another driver taking it over isn't this client's error."""
+    run_id, created = _create_run(conn, order_id, scenario, idempotency_key)
+    if not created:
+        return run_id, False
+    try:
+        advance(conn, run_id)
+    except Conflict:
+        pass  # Someone else is driving the new run. Saying otherwise invites a retry, and a second run.
     return run_id, True
 
 
 def start_run(conn, order_id: str, scenario: Scenario, hook: Hook | None = None,
               idempotency_key: str | None = None) -> str:
-    return start_run_once(conn, order_id, scenario, idempotency_key, hook)[0]
+    """Create and drive a run, for a caller that wants to know if it lost the run."""
+    run_id, created = _create_run(conn, order_id, scenario, idempotency_key)
+    if created:
+        advance(conn, run_id, hook)
+    return run_id
 
 
 def advance(conn, run_id: str, hook: Hook | None = None) -> str:

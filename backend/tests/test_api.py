@@ -1,13 +1,34 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from aegisflow import runtime
 from aegisflow.api import create_app, create_site
+from aegisflow.db import connect
 
 
 def create(client, order_id, **scenario):
     r = client.post("/runs", json={"order_id": order_id, "scenario": scenario})
     assert r.status_code == 201, r.text
     return r.json()
+
+
+def test_a_run_another_driver_takes_over_is_still_reported_as_created(db_path, monkeypatch):
+    client = TestClient(create_app(db_path))
+    real = runtime.current.invoke
+
+    def taken_over(name, key, call):
+        other = connect(db_path)
+        other.execute("UPDATE runs SET lease_epoch=lease_epoch+1")  # A newer driver, while this one was busy.
+        other.close()
+        monkeypatch.setattr(runtime.current, "invoke", real)
+        return real(name, key, call)
+
+    monkeypatch.setattr(runtime.current, "invoke", taken_over)
+    response = client.post("/runs", json={"order_id": "ORD-1001"})
+
+    assert response.status_code == 201  # A 409 would tell a client with no key to try again: a second run.
+    assert response.json()["status"] == "running"
+    assert len(client.get("/runs").json()) == 1
 
 
 def test_low_value_run_end_to_end(client):
