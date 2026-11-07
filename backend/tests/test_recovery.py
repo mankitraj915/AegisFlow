@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from aegisflow import engine
+from aegisflow import engine, tools
 from aegisflow.db import connect
 from aegisflow.models import Scenario
 
@@ -136,6 +136,77 @@ def test_lease_is_released_on_crash_and_expires_after_a_kill(conn):
     conn.execute("UPDATE runs SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?", (run_id,))
     assert engine.resume(conn, run_id) == "succeeded"
     assert len(refunds(conn)) == 1 and lease(conn, run_id) is None
+
+
+def expire_lease(conn):
+    conn.execute("UPDATE runs SET lease_expires_at='2000-01-01T00:00:00+00:00'")
+
+
+def stalled_tool(monkeypatch, name, while_stalled, then):
+    """Tool `name` lets a takeover happen during its first call, then ends with `then()`."""
+    real, calls = tools.TOOLS[name], []
+
+    def tool(conn, key, state):
+        calls.append(key)
+        if len(calls) == 1:
+            while_stalled(key.split(":")[0])
+            return then(conn, key, state)
+        return real(conn, key, state)
+
+    monkeypatch.setitem(tools.TOOLS, name, tool)
+    return real
+
+
+@pytest.mark.parametrize("name,outcome", [("notify_customer", "fatal"), ("notify_customer", "success"),
+                                          ("issue_refund", "retryable"), ("fetch_customer", "success")])
+def test_a_stale_driver_cannot_write_after_a_newer_one_took_over(db_path, monkeypatch, name, outcome):
+    stale, newer = connect(db_path), connect(db_path)
+    resumed = []
+
+    def take_over(run_id):
+        expire_lease(newer)  # A stall past LEASE_S, or a forward clock jump, does exactly this.
+        resumed.append(engine.resume(newer, run_id))
+
+    def end(conn, key, state):
+        if outcome == "fatal":
+            raise tools.ToolError("gateway error after the stall")
+        if outcome == "retryable":
+            raise tools.RetryableToolError("timeout after the stall")
+        return real(conn, key, state)
+
+    real = stalled_tool(monkeypatch, name, take_over, end)
+    with pytest.raises(engine.LeaseLost):
+        engine.start_run(stale, "ORD-1001", Scenario())
+    assert resumed == ["succeeded"]
+
+    run_id = newer.execute("SELECT id FROM runs").fetchone()["id"]
+    assert engine.get_run(newer, run_id).status == "succeeded"
+    final = steps(newer, run_id)
+    assert [s["name"] for s in final] == PIPELINE and all(s["status"] == "succeeded" for s in final)
+    types = [e.type for e in events(newer, run_id)]
+    assert types.count("run_succeeded") == 1 and "run_failed" not in types and types[-1] == "run_succeeded"
+    assert len(refunds(newer)) == 1 and lease(newer, run_id) is None
+    stale.close()
+    newer.close()
+
+
+def test_every_claim_gets_a_higher_fencing_epoch(conn):
+    run_id = engine.start_run(conn, "ORD-2002", Scenario())
+    epochs = [conn.execute("SELECT lease_epoch FROM runs WHERE id=?", (run_id,)).fetchone()[0]]
+    for act in (lambda: engine.advance(conn, run_id), lambda: engine.approve(conn, run_id, "ops")):
+        act()
+        epochs.append(conn.execute("SELECT lease_epoch FROM runs WHERE id=?", (run_id,)).fetchone()[0])
+    assert epochs == sorted(set(epochs)) and epochs[0] >= 1
+
+
+def test_a_stale_driver_with_no_successor_may_still_finish(db_path, monkeypatch):
+    conn = connect(db_path)
+    real = tools.TOOLS["notify_customer"]
+    stalled_tool(monkeypatch, "notify_customer", lambda run_id: expire_lease(conn), real)
+    # Expired, but nobody took over: its epoch is still the newest, so its writes are valid.
+    run_id = engine.start_run(conn, "ORD-1001", Scenario())
+    assert engine.get_run(conn, run_id).status == "succeeded"
+    conn.close()
 
 
 def test_interrupted_flag_follows_persisted_events(conn):

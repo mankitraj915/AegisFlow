@@ -16,15 +16,23 @@ recorded, exactly like a crash at the after_tool hook, except that advance()
 returns normally and records run_interrupted. The run stays 'running' until
 resume() continues it with the same step and key.
 
-Concurrency: every advance() first takes the run's lease (runs.lease_token) in
-a write transaction, so at most one advance() drives a run at a time; another
-caller gets Conflict. The lease is released when advance() returns or raises.
-One left behind by a killed process expires after LEASE_S, which is far longer
-than any advance() takes under RETRY_POLICY.
+Concurrency: every advance() first takes the run's lease in a write transaction,
+so normally one advance() drives a run at a time and another caller gets
+Conflict. The lease is released when advance() returns or raises, and one left
+behind by a killed process expires after LEASE_S.
+
+Expiry alone can't guarantee exclusion: a driver that stalls past LEASE_S, or
+whose lease a forward clock jump expires, doesn't know it has been replaced. So
+each claim increments runs.lease_epoch, a fencing token, and every write a driver
+makes first checks its epoch in the same transaction (_fenced_tx). Once a newer
+driver has claimed the run, the old one's writes raise LeaseLost and change
+nothing. The clock decides when a takeover may happen; only the epoch decides
+whose writes count.
 """
 import json
 import sqlite3
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -71,6 +79,10 @@ class Conflict(Exception):
     pass
 
 
+class LeaseLost(Conflict):
+    """A newer driver has claimed this run. Nothing was written."""
+
+
 def _dumps(obj) -> str:
     return json.dumps(obj, sort_keys=True)
 
@@ -108,30 +120,41 @@ def _load_state(conn, run) -> dict:
     return {"order_id": run["order_id"], "scenario": json.loads(run["scenario_json"]), "outputs": outputs}
 
 
-def _claim(conn, run_id: str) -> str:
-    """Take the run's lease or raise Conflict. Must be called inside tx()."""
-    token = runtime.current.new_id()
+def _claim(conn, run_id: str) -> int:
+    """Take the run's lease or raise Conflict, returning the new fencing epoch.
+    Must be called inside tx()."""
     claimed_at = now()
     expires = (datetime.fromisoformat(claimed_at) + timedelta(seconds=LEASE_S)).isoformat()
     claimed = conn.execute(
-        "UPDATE runs SET lease_token=?, lease_expires_at=? "
+        "UPDATE runs SET lease_epoch=lease_epoch+1, lease_token=lease_epoch+1, lease_expires_at=? "
         "WHERE id=? AND (lease_token IS NULL OR lease_expires_at < ?)",
-        (token, expires, run_id, claimed_at),
+        (expires, run_id, claimed_at),
     ).rowcount
     if not claimed:
         raise Conflict(f"run {run_id} is already being advanced")
-    return token
+    return conn.execute("SELECT lease_epoch FROM runs WHERE id=?", (run_id,)).fetchone()[0]
 
 
-def _drive(conn, run_id: str, token: str, hook: Hook | None) -> str:
+@contextmanager
+def _fenced_tx(conn, run_id: str, epoch: int):
+    """A write transaction that commits only if `epoch` still owns the run. The
+    check and the writes are atomic, so a driver can't be replaced between them."""
+    with tx(conn):
+        current = conn.execute("SELECT lease_epoch FROM runs WHERE id=?", (run_id,)).fetchone()[0]
+        if current != epoch:
+            raise LeaseLost(f"run {run_id} was taken over: this driver holds epoch {epoch}, the run is at {current}")
+        yield
+
+
+def _drive(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
     """Advance under a lease the caller took, releasing it however advancing ends."""
     try:
-        return _advance(conn, run_id, hook)
+        return _advance(conn, run_id, epoch, hook)
     finally:
         with tx(conn):
             conn.execute(
-                "UPDATE runs SET lease_token=NULL, lease_expires_at=NULL WHERE id=? AND lease_token=?",
-                (run_id, token),
+                "UPDATE runs SET lease_token=NULL, lease_expires_at=NULL WHERE id=? AND lease_epoch=?",
+                (run_id, epoch),
             )
 
 
@@ -154,8 +177,8 @@ def advance(conn, run_id: str, hook: Hook | None = None) -> str:
     Returns status. Raises Conflict if another advance() holds the run."""
     with tx(conn):
         _get_run(conn, run_id)
-        token = _claim(conn, run_id)
-    return _drive(conn, run_id, token, hook)
+        epoch = _claim(conn, run_id)
+    return _drive(conn, run_id, epoch, hook)
 
 
 def resume(conn, run_id: str, hook: Hook | None = None) -> str:
@@ -164,17 +187,19 @@ def resume(conn, run_id: str, hook: Hook | None = None) -> str:
         run = _get_run(conn, run_id)
         if run["status"] != "running":
             raise Conflict(f"run {run_id} is {run['status']}; only a running run can be resumed")
-        token = _claim(conn, run_id)
+        epoch = _claim(conn, run_id)
         pending = conn.execute(
             "SELECT idx, name, idempotency_key FROM steps WHERE run_id=? AND status='started'", (run_id,)
         ).fetchone()
         _event(conn, run_id, "run_resumed", dict(pending) if pending else {})
-    return _drive(conn, run_id, token, hook)
+    return _drive(conn, run_id, epoch, hook)
 
 
-def _advance(conn, run_id: str, hook: Hook | None) -> str:
+def _advance(conn, run_id: str, epoch: int, hook: Hook | None) -> str:
     while True:
         run = _get_run(conn, run_id)
+        if run["lease_epoch"] != epoch:
+            raise LeaseLost(f"run {run_id} was taken over from epoch {epoch}")  # Don't start work for nothing.
         if run["status"] != "running":
             return run["status"]
         state = _load_state(conn, run)
@@ -189,16 +214,16 @@ def _advance(conn, run_id: str, hook: Hook | None) -> str:
         else:
             name = planner.decide(state)
             if name is None:
-                with tx(conn):
+                with _fenced_tx(conn, run_id, epoch):
                     _set_status(conn, run_id, "succeeded")
                     _event(conn, run_id, "run_succeeded", {})
                 return "succeeded"
             idx = conn.execute("SELECT COUNT(*) FROM steps WHERE run_id=?", (run_id,)).fetchone()[0]
-            if _needs_approval(conn, run_id, idx, name, state):
+            if _needs_approval(conn, run_id, epoch, idx, name, state):
                 return "awaiting_approval"
             key = f"{run_id}:{idx}"
             attempt = 1
-            with tx(conn):
+            with _fenced_tx(conn, run_id, epoch):
                 conn.execute(
                     "INSERT INTO steps(run_id, idx, name, status, input_json, attempt, idempotency_key, "
                     "started_at) VALUES (?,?,?,?,?,?,?,?)",
@@ -211,18 +236,15 @@ def _advance(conn, run_id: str, hook: Hook | None) -> str:
         except tools.RetryableToolError as exc:
             if attempt < RETRY_POLICY.max_attempts:
                 delay = RETRY_POLICY.delay(attempt)
-                with tx(conn):
-                    # Conditional on attempt so a stale caller cannot double-bump.
-                    bumped = conn.execute(
-                        "UPDATE steps SET attempt=attempt+1, error=? "
-                        "WHERE run_id=? AND idx=? AND status='started' AND attempt=?",
-                        (str(exc), run_id, idx, attempt),
-                    ).rowcount
-                    if bumped:
-                        _event(conn, run_id, "step_attempt_failed", {
-                            "idx": idx, "name": name, "attempt": attempt, "error": str(exc),
-                            "retryable": True, "next_delay_s": delay,
-                        })
+                with _fenced_tx(conn, run_id, epoch):
+                    conn.execute(
+                        "UPDATE steps SET attempt=attempt+1, error=? WHERE run_id=? AND idx=?",
+                        (str(exc), run_id, idx),
+                    )
+                    _event(conn, run_id, "step_attempt_failed", {
+                        "idx": idx, "name": name, "attempt": attempt, "error": str(exc),
+                        "retryable": True, "next_delay_s": delay,
+                    })
                 if hook:
                     hook("retry_scheduled", name)
                 runtime.current.sleep(delay)  # Outside tx(): never hold the write lock while waiting.
@@ -231,40 +253,37 @@ def _advance(conn, run_id: str, hook: Hook | None) -> str:
             if name in tools.SIDE_EFFECTING:
                 # The effect may have committed before the failure; the key finds it.
                 info |= {"idempotency_key": key, "outcome_unknown": True}
-            return _fail(conn, run_id, idx, name, f"retries exhausted after {attempt} attempts: {exc}", info)
+            return _fail(conn, run_id, epoch, idx, name, f"retries exhausted after {attempt} attempts: {exc}", info)
         except tools.ToolError as exc:
-            return _fail(conn, run_id, idx, name, str(exc), {"attempt": attempt, "retryable": False})
+            return _fail(conn, run_id, epoch, idx, name, str(exc), {"attempt": attempt, "retryable": False})
 
         if hook:
             hook("after_tool", name)
         if _interrupt_planned(conn, run_id, idx, name, attempt, state):
-            with tx(conn):
+            with _fenced_tx(conn, run_id, epoch):
                 _event(conn, run_id, "run_interrupted", {
                     "idx": idx, "name": name, "attempt": attempt, "idempotency_key": key, "simulated": True,
                 })
             return "running"
 
-        with tx(conn):
-            # Conditional: a concurrent advance may already have completed this step.
-            done = conn.execute(
-                "UPDATE steps SET status='succeeded', output_json=?, finished_at=? "
-                "WHERE run_id=? AND idx=? AND status='started'",
+        with _fenced_tx(conn, run_id, epoch):
+            conn.execute(
+                "UPDATE steps SET status='succeeded', output_json=?, finished_at=? WHERE run_id=? AND idx=?",
                 (_dumps(output), now(), run_id, idx),
-            ).rowcount
-            if done:
-                state["outputs"][name] = output
-                conn.execute(
-                    "INSERT INTO checkpoints(run_id, after_step_idx, state_json, ts) VALUES (?,?,?,?)",
-                    (run_id, idx, _dumps(state), now()),
-                )
-                _event(conn, run_id, "step_succeeded", {
-                    "idx": idx, "name": name, "attempt": attempt, "output": output,
-                })
+            )
+            state["outputs"][name] = output
+            conn.execute(
+                "INSERT INTO checkpoints(run_id, after_step_idx, state_json, ts) VALUES (?,?,?,?)",
+                (run_id, idx, _dumps(state), now()),
+            )
+            _event(conn, run_id, "step_succeeded", {
+                "idx": idx, "name": name, "attempt": attempt, "output": output,
+            })
 
 
-def _fail(conn, run_id: str, idx: int, name: str, error: str, info: dict) -> str:
+def _fail(conn, run_id: str, epoch: int, idx: int, name: str, error: str, info: dict) -> str:
     """Terminal step failure: fails the step and the run; no later step runs."""
-    with tx(conn):
+    with _fenced_tx(conn, run_id, epoch):
         conn.execute(
             "UPDATE steps SET status='failed', error=?, finished_at=? WHERE run_id=? AND idx=?",
             (error, now(), run_id, idx),
@@ -287,7 +306,7 @@ def _interrupt_planned(conn, run_id: str, idx: int, name: str, attempt: int, sta
     ).fetchone() is None
 
 
-def _needs_approval(conn, run_id: str, idx: int, name: str, state: dict) -> bool:
+def _needs_approval(conn, run_id: str, epoch: int, idx: int, name: str, state: dict) -> bool:
     """True if the run must pause before step idx. Creates the pending approval."""
     reason = planner.approval_reason(name, state)
     if reason is None:
@@ -297,7 +316,7 @@ def _needs_approval(conn, run_id: str, idx: int, name: str, state: dict) -> bool
     ).fetchone()
     if existing is not None and existing["status"] == "approved":
         return False
-    with tx(conn):
+    with _fenced_tx(conn, run_id, epoch):
         if existing is None:
             conn.execute(
                 "INSERT INTO approvals(run_id, step_idx, status, requested_payload_json) VALUES (?,?,?,?)",
@@ -311,9 +330,9 @@ def _needs_approval(conn, run_id: str, idx: int, name: str, state: dict) -> bool
     return True
 
 
-def _decide(conn, run_id: str, decision: str, decided_by: str, reason: str | None) -> str | None:
+def _decide(conn, run_id: str, decision: str, decided_by: str, reason: str | None) -> int | None:
     """Record the decision. On approval, also takes the run's lease, in the same
-    transaction, and returns its token for the caller to advance under."""
+    transaction, and returns its epoch for the caller to advance under."""
     _get_run(conn, run_id)
     new_run_status = "running" if decision == "approved" else "rejected"
     with tx(conn):
@@ -335,9 +354,9 @@ def _decide(conn, run_id: str, decision: str, decided_by: str, reason: str | Non
 
 
 def approve(conn, run_id: str, decided_by: str, hook: Hook | None = None) -> str:
-    token = _decide(conn, run_id, "approved", decided_by, None)
-    assert token is not None
-    return _drive(conn, run_id, token, hook)
+    epoch = _decide(conn, run_id, "approved", decided_by, None)
+    assert epoch is not None
+    return _drive(conn, run_id, epoch, hook)
 
 
 def reject(conn, run_id: str, decided_by: str, reason: str | None = None) -> str:
