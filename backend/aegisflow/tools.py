@@ -11,6 +11,7 @@ deterministic fault plan for the given attempt.
 import sqlite3
 from collections.abc import Callable
 
+from . import runtime
 from .db import now, tx
 
 
@@ -82,34 +83,48 @@ def propose_refund(conn, key, state):
     }
 
 
+class SqlLedger:
+    """The mock payment system: a refunds table reached through one connection.
+    Production uses the engine's own database; the simulator runs it separately."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def issue(self, key: str, order_id: str, amount: int) -> None:
+        with tx(self.conn):
+            row = self.conn.execute(
+                "SELECT order_id, amount_paise FROM refunds WHERE idempotency_key=?", (key,)
+            ).fetchone()
+            if row is None:
+                self.conn.execute(
+                    "INSERT INTO refunds(idempotency_key, order_id, amount_paise, created_at) VALUES (?,?,?,?)",
+                    (key, order_id, amount, now()),
+                )
+            elif (row["order_id"], row["amount_paise"]) != (order_id, amount):
+                raise ToolError(
+                    f"idempotency key {key} already used for {row['order_id']}/{row['amount_paise']}, "
+                    f"refusing {order_id}/{amount}"
+                )
+
+
+def _ledger(conn):
+    make = runtime.current.ledger
+    return make(conn) if make else SqlLedger(conn)
+
+
 def issue_refund(conn: sqlite3.Connection, key: str, state) -> dict:
     proposal = state["outputs"]["propose_refund"]
     order_id, amount = proposal["order_id"], proposal["amount_paise"]
-    with tx(conn):
-        row = conn.execute(
-            "SELECT order_id, amount_paise FROM refunds WHERE idempotency_key=?", (key,)
-        ).fetchone()
-        if row is None:
-            conn.execute(
-                "INSERT INTO refunds(idempotency_key, order_id, amount_paise, created_at) VALUES (?,?,?,?)",
-                (key, order_id, amount, now()),
-            )
-        elif (row["order_id"], row["amount_paise"]) != (order_id, amount):
-            raise ToolError(
-                f"idempotency key {key} already used for {row['order_id']}/{row['amount_paise']}, "
-                f"refusing {order_id}/{amount}"
-            )
+    _ledger(conn).issue(key, order_id, amount)
     return {"refund_id": key, "order_id": order_id, "amount_paise": amount}
 
 
 def notify_customer(conn, key, state):
     customer = state["outputs"]["fetch_customer"]
     refund = state["outputs"]["issue_refund"]
-    return {
-        "channel": "email",
-        "to": customer["email"],
-        "message": f"Your refund of {refund['amount_paise']} paise for {refund['order_id']} has been issued.",
-    }
+    message = f"Your refund of {refund['amount_paise']} paise for {refund['order_id']} has been issued."
+    runtime.current.send_message(customer["email"], message)
+    return {"channel": "email", "to": customer["email"], "message": message}
 
 
 TOOLS: dict[str, Callable] = {
@@ -134,7 +149,7 @@ def call(conn, name: str, key: str, state, attempt: int) -> dict:
         raise ToolError(f"injected fatal fault: {name} attempt {attempt}")
     if fault == "retryable":
         raise RetryableToolError(f"injected transient fault: {name} attempt {attempt}")
-    output = TOOLS[name](conn, key, state)
+    output = runtime.current.invoke(name, key, lambda: TOOLS[name](conn, key, state))
     if fault == "retryable_after_commit":
         raise RetryableToolError(f"injected timeout after commit: {name} attempt {attempt}")
     return output
