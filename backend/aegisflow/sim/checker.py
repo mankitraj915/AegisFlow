@@ -7,7 +7,7 @@ shares no logic with the engine, so an engine bug can't hide by agreeing with it
 import json
 from collections import Counter, defaultdict
 
-from .. import engine, planner, tools
+from .. import db, engine, planner, tools
 from .scheduler import Proc
 from .storage import WRITE_VERBS
 
@@ -92,7 +92,8 @@ class Checker:
         self.committed(None)
 
     def statement(self, proc: Proc, verb: str) -> None:
-        if proc.readonly and verb in WRITE_VERBS:
+        schema_current = self.world.keeper.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+        if proc.readonly and verb in WRITE_VERBS and schema_current:  # Someone has to create it first.
             self.fail("read_path_writes", f"{proc.name} ran {verb} on a read-only path")
 
     def external_changed(self) -> None:
