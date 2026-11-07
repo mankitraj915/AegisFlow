@@ -18,14 +18,34 @@ EXPECTED_ERRORS = (engine.Conflict, engine.RunNotFound, engine.OrderNotFound)
 
 
 class _Provider(tools.SqlLedger):
-    """The external system, counting what it really delivers."""
+    """The external system, counting what it really delivers. Its own clock is true
+    time, not the engine's. With a retention window it stops deduplicating keys once
+    they're older than that, the way real providers expire idempotency keys."""
 
-    def __init__(self, conn: sqlite3.Connection, deliveries: Counter):
+    def __init__(self, conn: sqlite3.Connection, deliveries: Counter, now_us, retention_us: int | None):
         super().__init__(conn)
         self.deliveries = deliveries
+        self.now_us, self.retention_us = now_us, retention_us
+        self.first_seen: dict[str, int] = {}
+        self.repeats: Counter = Counter()
+
+    def forgotten(self, key: str) -> bool:
+        seen = self.first_seen.get(key)
+        return seen is not None and self.retention_us is not None and self.now_us() - seen > self.retention_us
+
+    def _key_to_use(self, key: str) -> str:
+        """The key itself, or a fresh entry when the provider no longer remembers it."""
+        if self.forgotten(key):
+            self.repeats[key] += 1
+            return f"{key}#{self.repeats[key]}"
+        self.first_seen.setdefault(key, self.now_us())
+        return key
+
+    def issue(self, key: str, order_id: str, amount: int) -> None:
+        super().issue(self._key_to_use(key), order_id, amount)
 
     def send_message(self, key: str, to: str, message: str) -> bool:
-        delivered = super().send_message(key, to, message)
+        delivered = super().send_message(self._key_to_use(key), to, message)
         if delivered:
             self.deliveries[key] += 1
         return delivered
@@ -47,7 +67,9 @@ class World:
         self.keeper = raw_connect(path)  # Holds the WAL open: no last-close checkpoint.
         self.keeper.execute("PRAGMA journal_mode=WAL")
         self.external = self._open_external()
-        self.ledger = _Provider(self.external, self.deliveries)
+        retention = plan.retention_us if "provider_forgets" in plan.enabled else None
+        self.ledger = _Provider(self.external, self.deliveries, lambda: self.sched.true_us, retention)
+        self.failed_keys: set[str] = set()
 
     @staticmethod
     def _open_external() -> sqlite3.Connection:
@@ -136,6 +158,14 @@ class World:
             sched.sleep_us(self._values.randrange(61_000_000, 130_000_000))  # Beyond the lease.
         elif self.on("tool_delay"):
             sched.sleep_us(self._values.randrange(1_000, 3_000_000))
+        try:
+            return self._exchange(name, key, call)
+        except (tools.RetryableToolError, tools.ToolError):
+            self.failed_keys.add(key)
+            raise
+
+    def _exchange(self, name: str, key: str, call) -> dict:
+        sched = self.sched
         if self.on("tool_drop_request"):
             raise tools.RetryableToolError("simulated: request lost")
         if self.on("tool_fatal"):
@@ -148,6 +178,13 @@ class World:
         if self.on("tool_duplicate"):
             self._apply(call)
         sched.step(f"tool-done {name}")
+        if name in tools.SIDE_EFFECTING:
+            if self.on("provider_false_error"):
+                raise tools.ToolError("simulated: provider reported an error for a request it executed")
+            # A blocking client can't see replies out of order on one connection, so reordering
+            # shows up as a retry that is answered with the earlier request's failure.
+            if key in self.failed_keys and self.on("provider_stale_response"):
+                raise tools.ToolError("simulated: reply to an earlier request arrived for this one")
         if self.on("tool_drop_response"):
             raise tools.RetryableToolError("simulated: response lost")
         return output
@@ -244,6 +281,7 @@ class World:
         self.sched.run_until_idle()
         self.faults_on = False
         db.ensure_schema(self.keeper)  # A crash may have beaten every connect() to it.
+        self.sched.true_us += self.plan.outage_us  # Nobody looks at the system for a while.
         for number in range(OPERATOR_ROUNDS):
             if not self.unfinished():
                 return

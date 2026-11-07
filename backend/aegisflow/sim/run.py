@@ -44,9 +44,9 @@ class Result:
 
 
 def simulate(seed: int, only: set[str] | None = None, without: frozenset[str] = frozenset(),
-             keep_trace: bool = False) -> Result:
+             keep_trace: bool = False, also: frozenset[str] = frozenset()) -> Result:
     previous_stack = threading.stack_size(_STACK_BYTES)
-    plan = make_plan(seed, only, without)
+    plan = make_plan(seed, only, without, also)
     world = World(seed, plan, _path(seed), keep_trace)
     checker = Checker(world)
     world.observers.append(checker)

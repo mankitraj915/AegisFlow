@@ -22,10 +22,19 @@ FAULT_RATES: dict[str, tuple[float, float]] = {
     "tool_delay": (0.03, 0.3),
     "tool_stall": (0.02, 0.2),
     "tool_late_delivery": (0.03, 0.2),
+    # A less forgiving provider: it reports an error for a request it executed, and
+    # answers a retry with the failure it gave the earlier request.
+    "provider_false_error": (0.03, 0.3),
+    "provider_stale_response": (0.1, 0.5),
 }
 # Workload shapes, switched per seed like faults.
-SHAPES = ("duplicate_commands", "scenario_faults", "readers", "stale_operators")
-FEATURES = tuple(FAULT_RATES) + SHAPES
+SHAPES = ("duplicate_commands", "scenario_faults", "readers", "stale_operators", "provider_forgets")
+# Not yet in every seed's draw: run with `survey --also`.
+OPT_IN = {"provider_false_error", "provider_stale_response", "provider_forgets"}
+FEATURES = tuple(f for f in (*FAULT_RATES, *SHAPES) if f not in OPT_IN)
+# How long a forgetful provider remembers a key, and how long an outage can age a run.
+RETENTION_S = (310, 700)
+LONG_OUTAGE_S = 800
 
 ORDERS = ["ORD-1001", "ORD-1002", "ORD-2002", "ORD-3003", "ORD-4004", "ORD-9009"]
 SCENARIO_FAULTS = ["retryable", "fatal", "retryable_after_commit", "interrupt_after_commit"]
@@ -51,6 +60,8 @@ class Plan:
     rates: dict[str, float]
     stickiness: float
     commands: list[Command]
+    retention_us: int = 0
+    outage_us: int = 0
 
 
 def _when(rng: random.Random) -> int:
@@ -76,16 +87,23 @@ def _scenario(rng: random.Random, with_faults: bool) -> dict:
     return scenario
 
 
-def make_plan(seed: int, only: set[str] | None = None, without: set[str] | frozenset[str] = frozenset()) -> Plan:
+def make_plan(seed: int, only: set[str] | None = None, without: set[str] | frozenset[str] = frozenset(),
+              also: set[str] | frozenset[str] = frozenset()) -> Plan:
     rng = random.Random(f"{seed}:plan")
     # Swarm testing: each seed runs a random subset of faults, so one fault's
     # failures can't always mask the rarer path that another fault needs.
     enabled = {f for f in FEATURES if rng.random() < 0.4}
-    rates = {f: rng.uniform(*span) for f, span in FAULT_RATES.items()}
+    rates = {f: rng.uniform(*span) for f, span in FAULT_RATES.items() if f not in OPT_IN}
     stickiness = rng.choice([0.0, 0.5, 0.9])
     if only is not None:
         enabled = set(only)
+    # Drawn from their own stream, so an opt-in feature leaves the seed's other draws alone.
+    side = random.Random(f"{seed}:side")
+    rates |= {f: side.uniform(*span) for f, span in FAULT_RATES.items() if f in OPT_IN}
+    enabled |= {f for f in also if side.random() < 0.5}
     enabled -= set(without)
+    retention_us = side.randrange(*RETENTION_S) * 1_000_000
+    outage_us = side.randrange(LONG_OUTAGE_S) * 1_000_000 if "provider_forgets" in enabled else 0
 
     commands = []
     weights = [LOW_VALUE_ORDER_WEIGHT, 2, 2, 1, 1, 1]
@@ -106,4 +124,4 @@ def make_plan(seed: int, only: set[str] | None = None, without: set[str] | froze
     if "readers" in enabled:
         for _ in range(readers):
             commands.append(Command("read", _when(rng), pick=rng.random()))
-    return Plan(enabled, rates, stickiness, commands)
+    return Plan(enabled, rates, stickiness, commands, retention_us, outage_us)
