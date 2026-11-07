@@ -1,4 +1,4 @@
-import type { Run, RunEvent } from "./api";
+import type { Run } from "./api";
 
 // Integer paise in, rupee string out; no floating-point arithmetic on money.
 export function formatPaise(paise: number): string {
@@ -32,22 +32,20 @@ export const STEP_INFO: Record<string, { title: string; does: string }> = {
 
 export type Tone = "ok" | "run" | "gate" | "cut" | "fail" | "unknown" | "idle";
 
-// Run statuses, plus two derived from events rather than the backend status:
-// "outcome_unknown", a failed run whose side-effecting step failed when its
-// effect may have committed, and "interrupted", a running run
-// stopped by a simulated interruption that has not been resumed.
+// Run statuses, plus one derived from events rather than the backend status:
+// "interrupted", a running run stopped by a simulated interruption that has
+// not been resumed.
 const RUN_STATUS: Record<string, { label: string; tone: Tone }> = {
   running: { label: "Running", tone: "run" },
   succeeded: { label: "Succeeded", tone: "ok" },
   failed: { label: "Failed", tone: "fail" },
   awaiting_approval: { label: "Awaiting approval", tone: "gate" },
   rejected: { label: "Rejected", tone: "fail" },
-  outcome_unknown: { label: "Outcome unknown", tone: "unknown" },
+  needs_review: { label: "Needs review", tone: "unknown" },
   interrupted: { label: "Interrupted", tone: "cut" },
 };
 
-export function displayStatus(run: Run, outcomeUnknown = false): string {
-  if (outcomeUnknown) return "outcome_unknown";
+export function displayStatus(run: Run): string {
   return run.interrupted ? "interrupted" : run.status;
 }
 
@@ -59,8 +57,4 @@ export function StatusMark({ status }: { status: string }) {
       {label}
     </span>
   );
-}
-
-export function outcomeUnknownEvent(events: RunEvent[]): RunEvent | undefined {
-  return events.find((e) => e.type === "run_failed" && e.payload.outcome_unknown === true);
 }

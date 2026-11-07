@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { api, messageOf, PIPELINE, type Approval, type RunDetail as Detail, type RunEvent, type Step } from "./api";
 import {
-  displayStatus, formatPaise, formatTime, Ident, outcomeUnknownEvent, shortId, STEP_INFO, StatusMark, type Tone,
+  displayStatus, formatPaise, formatTime, Ident, shortId, STEP_INFO, StatusMark, type Tone,
 } from "./format";
 
 type Loaded = { run: Detail; events: RunEvent[] };
@@ -29,14 +29,15 @@ interface Station {
   failedAttempts: Set<number>;
 }
 
-function stationsOf(run: Detail, events: RunEvent[], unknown: boolean): Station[] {
+function stationsOf(run: Detail, events: RunEvent[]): Station[] {
   const stopped = run.status === "failed" || run.status === "rejected";
   return PIPELINE.map((name, idx) => {
     const step = run.steps[idx];
     let state: StationState;
     if (step) {
       if (step.status === "succeeded") state = "done";
-      else if (step.status === "failed") state = unknown ? "unknown" : "failed";
+      else if (step.status === "failed") state = "failed";
+      else if (run.status === "needs_review") state = "unknown";
       else state = run.interrupted ? "interrupted" : "active";
     } else if (idx === run.steps.length && run.status === "awaiting_approval") state = "gate";
     else if (idx === run.steps.length && run.status === "rejected") state = "rejected";
@@ -86,8 +87,7 @@ export function RunDetail({ runId, onChanged }: { runId: string; onChanged: () =
   }
 
   const { run, events } = data;
-  const unknown = outcomeUnknownEvent(events);
-  const stations = stationsOf(run, events, !!unknown);
+  const stations = stationsOf(run, events);
   const { scenario } = run;
   const faultSteps = Object.keys(scenario.faults ?? {});
   const proposed = run.steps[3]?.output?.amount_paise;
@@ -96,7 +96,7 @@ export function RunDetail({ runId, onChanged }: { runId: string; onChanged: () =
   const started = run.steps.find((s) => s.status === "started");
   const actionAt = run.status === "awaiting_approval" && run.pending_approval
     ? run.pending_approval.step_idx
-    : run.status === "running" ? (started?.idx ?? run.steps.length) : null;
+    : run.status === "running" || run.status === "needs_review" ? (started?.idx ?? run.steps.length) : null;
 
   return (
     <article className="detail" aria-labelledby="detail-title">
@@ -107,9 +107,9 @@ export function RunDetail({ runId, onChanged }: { runId: string; onChanged: () =
         </div>
         <h2 id="detail-title" className="view-title">
           <span className="mono">{run.order_id}</span>
-          <StatusMark status={displayStatus(run, !!unknown)} />
+          <StatusMark status={displayStatus(run)} />
         </h2>
-        <Outcome run={run} events={events} unknownEvent={unknown} />
+        <Outcome run={run} events={events} />
         <dl className="facts">
           <div><dt>Run id</dt><dd className="mono">{run.id}</dd></div>
           <div><dt>Created</dt><dd>{formatTime(run.created_at)}</dd></div>
@@ -121,7 +121,8 @@ export function RunDetail({ runId, onChanged }: { runId: string; onChanged: () =
             <dd className={faultSteps.length ? "mono" : undefined}>
               {faultSteps.length
                 ? <Ident>{faultSteps.map((s) => `${s}: ${scenario.faults[s].join(", ")}`).join(" · ")}</Ident>
-                : "None"}
+                : scenario.provider_status_down ? null : "None"}
+              {scenario.provider_status_down && <>{faultSteps.length > 0 && " · "}status lookup down</>}
             </dd>
           </div>
         </dl>
@@ -145,10 +146,12 @@ export function RunDetail({ runId, onChanged }: { runId: string; onChanged: () =
           ))}
         </ol>
         {actionAt !== null && (
-          <div className={`callout tone-${run.status === "awaiting_approval" ? "gate" : run.interrupted ? "cut" : "run"}`}
+          <div className={`callout tone-${run.status === "awaiting_approval" ? "gate" : run.status === "needs_review" ? "unknown" : run.interrupted ? "cut" : "run"}`}
             style={{ "--at": actionAt } as React.CSSProperties}>
             {run.status === "awaiting_approval" && run.pending_approval ? (
               <ApprovalPanel runId={run.id} approval={run.pending_approval} onDecided={changed} />
+            ) : run.status === "needs_review" ? (
+              <ReviewPanel runId={run.id} step={started} onSettled={changed} />
             ) : (
               <ResumePanel interrupted={run.interrupted} step={started} runId={run.id} onResumed={changed} />
             )}
@@ -211,16 +214,17 @@ function approvalNote(events: RunEvent[]): string | null {
   return events.some((e) => e.type === "approval_requested") ? "Approval requested" : null;
 }
 
-function Outcome({ run, events, unknownEvent }: { run: Detail; events: RunEvent[]; unknownEvent: RunEvent | undefined }) {
+function Outcome({ run, events }: { run: Detail; events: RunEvent[] }) {
   let tone: Tone = "idle";
   let text: React.ReactNode = null;
   const keyed = (k: string) => <code>{k}</code>;
-  if (unknownEvent) {
+  if (run.status === "needs_review") {
+    const held = run.steps.find((s) => s.status === "started");
     tone = "unknown";
     text = (
       <>
-        A step stopped after its effect may have taken place: it ran out of retries or was refused on a retry. Check the external system for key{" "}
-        {keyed(String(unknownEvent.payload.idempotency_key))} before taking further action.
+        Nobody can yet say whether this step took effect, so the run is held rather than reported as failed. Nothing further
+        happens until it is settled. Check the external system for key {keyed(String(held?.idempotency_key))}.
         <span className="outcome-detail">{run.error}</span>
       </>
     );
@@ -371,14 +375,94 @@ function ResumePanel({ runId, interrupted, step, onResumed }: {
       {step && (
         <p>
           Step {step.idx}, <span className="mono">{step.name}</span>, is in progress with idempotency key{" "}
-          <code>{step.idempotency_key}</code>. Resuming re-runs it with the same key, so a refund already in the
-          ledger is replayed rather than written twice.
+          <code>{step.idempotency_key}</code>. Resuming asks the provider first: an effect already there is recorded
+          without another call, and otherwise the step retries under the same key.
         </p>
       )}
       {error && <p className="alert tone-fail" role="alert">{error}</p>}
       <div className="actions">
         <button type="button" className="primary" disabled={pending} onClick={resume}>
           {pending ? "Resuming…" : "Resume run"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function ReviewPanel({ runId, step, onSettled }: { runId: string; step: Step | undefined; onSettled: () => void }) {
+  const [decidedBy, setDecidedBy] = useState("");
+  const [pending, setPending] = useState<"recheck" | "applied" | "not_applied" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [nameError, setNameError] = useState(false);
+  const [unchanged, setUnchanged] = useState(false);
+
+  async function recheck() {
+    setError(null);
+    setUnchanged(false);
+    setPending("recheck");
+    try {
+      const run = await api.reconcile(runId);
+      if (run.status === "needs_review") setUnchanged(true);
+      else onSettled();
+    } catch (err) {
+      setError(messageOf(err));
+    } finally {
+      setPending(null);
+    }
+  }
+
+  async function resolve(outcome: "applied" | "not_applied") {
+    if (!decidedBy.trim()) {
+      setNameError(true);
+      return;
+    }
+    setNameError(false);
+    setError(null);
+    setPending(outcome);
+    try {
+      await api.resolve(runId, decidedBy.trim(), outcome);
+      onSettled();
+    } catch (err) {
+      // A 409 means the provider shows the effect, or someone else is settling this run.
+      setError(messageOf(err));
+    } finally {
+      setPending(null);
+    }
+  }
+
+  return (
+    <section aria-labelledby="review-title">
+      <h4 id="review-title" className="callout-title">Held for review</h4>
+      {step && (
+        <p>
+          Step {step.idx}, <span className="mono">{step.name}</span>, used key <code>{step.idempotency_key}</code>.
+          Re-checking asks the provider again. If you have checked its records yourself, say what you found.
+          The engine won't accept a denial of an effect the provider shows.
+        </p>
+      )}
+      <div className="field">
+        <label htmlFor="resolved-by">Your name or email</label>
+        <input
+          id="resolved-by"
+          value={decidedBy}
+          onChange={(e) => setDecidedBy(e.target.value)}
+          aria-invalid={nameError}
+          aria-describedby={nameError ? "resolved-by-error" : undefined}
+          autoComplete="email"
+        />
+        {nameError && <p id="resolved-by-error" className="field-error">Required to record who settled this.</p>}
+      </div>
+      {unchanged && <p className="hint" role="status">Still can't be settled: the provider shows no effect, or can't be reached.</p>}
+      {error && <p className="alert tone-fail" role="alert">{error}</p>}
+      <div className="actions">
+        <button type="button" className="primary" disabled={pending !== null} onClick={recheck}>
+          {pending === "recheck" ? "Asking…" : "Re-check with provider"}
+        </button>
+        <button type="button" disabled={pending !== null} onClick={() => resolve("applied")}>
+          {pending === "applied" ? "Recording…" : "It happened"}
+        </button>
+        <button type="button" className="danger" disabled={pending !== null} onClick={() => resolve("not_applied")}>
+          {pending === "not_applied" ? "Recording…" : "It did not happen"}
         </button>
       </div>
     </section>
@@ -456,6 +540,7 @@ function tone(e: RunEvent): Tone {
   if (e.type === "run_failed" || e.type === "step_failed" || e.type === "run_rejected") return "fail";
   if (e.type === "step_attempt_failed" || e.type === "approval_requested") return "gate";
   if (e.type === "run_interrupted") return "cut";
+  if (e.type === "run_needs_review") return "unknown";
   if (e.type === "run_succeeded") return "ok";
   return "idle";
 }
@@ -471,6 +556,9 @@ function summarize(e: RunEvent): string {
     case "step_attempt_failed": return `${step}${attempt} failed, retrying in ${p.next_delay_s}s: ${p.error}`;
     case "step_failed": return `${step}${attempt}: ${p.error}`;
     case "run_failed": return String(p.error);
+    case "step_reconciled": return `${step}: provider shows the effect under ${p.idempotency_key}${p.reported_error ? `, despite "${p.reported_error}"` : ""}`;
+    case "run_needs_review": return `Held at ${step}: ${p.reason}`;
+    case "run_review_cleared": return `Settled by ${p.by}: ${p.name} took effect`;
     case "run_interrupted": return `Simulated interruption after ${step}${attempt}, key ${p.idempotency_key}`;
     case "run_resumed": return p.name === undefined ? "Resumed" : `Resuming ${step} with key ${p.idempotency_key}`;
     case "approval_requested": return `${p.step}: ${p.reason}`;

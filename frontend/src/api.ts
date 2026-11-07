@@ -1,7 +1,7 @@
 // Typed client for the backend HTTP API (backend/aegisflow/api.py, models.py).
 // Requests go to /api, which the Vite dev/preview server proxies to the backend.
 
-export type RunStatus = "running" | "succeeded" | "failed" | "awaiting_approval" | "rejected";
+export type RunStatus = "running" | "succeeded" | "failed" | "awaiting_approval" | "rejected" | "needs_review";
 export type FaultKind = "retryable" | "fatal" | "retryable_after_commit" | "interrupt_after_commit";
 
 // Mirrors planner.PIPELINE; the backend rejects fault plans for other step names.
@@ -18,6 +18,7 @@ export interface Scenario {
   approval_threshold_paise: number;
   require_manual_review: boolean;
   faults: Record<string, FaultKind[]>;
+  provider_status_down: boolean;
 }
 
 export interface Run {
@@ -140,6 +141,9 @@ export const api = {
   resume: (id: string) => request<Run>(`/runs/${encodeURIComponent(id)}/resume`, { method: "POST" }),
   reject: (id: string, decided_by: string, reason: string | null) =>
     request<Run>(`/runs/${encodeURIComponent(id)}/reject`, post({ decided_by, reason })),
+  reconcile: (id: string) => request<Run>(`/runs/${encodeURIComponent(id)}/reconcile`, { method: "POST" }),
+  resolve: (id: string, decided_by: string, outcome: "applied" | "not_applied") =>
+    request<Run>(`/runs/${encodeURIComponent(id)}/resolve`, post({ decided_by, outcome })),
 };
 
 export function messageOf(err: unknown): string {

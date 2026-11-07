@@ -26,10 +26,6 @@ const FAULT_PRESETS: Record<string, { label: string; plan: FaultKind[] }> = {
   exhaust: { label: "Fails on every attempt", plan: ["retryable", "retryable", "retryable"] },
   fatal: { label: "Fatal error", plan: ["fatal"] },
   commit_once: { label: "Times out after commit, once", plan: ["retryable_after_commit"] },
-  commit_exhaust: {
-    label: "Times out after commit, every attempt",
-    plan: ["retryable_after_commit", "retryable_after_commit", "retryable_after_commit"],
-  },
   interrupt: { label: "Simulated interruption after commit (resume manually)", plan: ["interrupt_after_commit"] },
 };
 
@@ -38,6 +34,7 @@ interface Config {
   thresholdRupees: string;
   manualReview: boolean;
   faults: Record<string, string>; // step -> FAULT_PRESETS key
+  statusDown?: boolean;
 }
 
 // Each scenario is only a form configuration of behavior the backend supports.
@@ -59,16 +56,16 @@ const SCENARIOS: { key: string; title: string; what: string; kind: OrderKind; co
   {
     key: "retry",
     title: "Retry after commit",
-    what: "The refund commits, then times out once. The retry reuses the key: one ledger entry.",
+    what: "The refund commits, then times out. The engine asks the provider, finds it, and calls no further: one ledger entry.",
     kind: "under_threshold",
     config: { thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "commit_once" } },
   },
   {
     key: "unknown",
     title: "Outcome unknown",
-    what: "The refund times out after commit on all 3 attempts. The run fails with its outcome unknown.",
+    what: "The refund times out after commit and the status lookup is down too, so nobody can tell. The run is held for review, not failed.",
     kind: "under_threshold",
-    config: { thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "commit_exhaust" } },
+    config: { thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "commit_once" }, statusDown: true },
   },
   {
     key: "interrupt",
@@ -96,7 +93,7 @@ export function CreateRunForm({ onCreated }: { onCreated: (run: Run) => void }) 
   const requestKey = useRef(crypto.randomUUID());
   const [errors, setErrors] = useState<Errors>({});
   const [submitting, setSubmitting] = useState(false);
-  const { orderId, thresholdRupees, manualReview, faults } = config;
+  const { orderId, thresholdRupees, manualReview, faults, statusDown } = config;
 
   // Picks the next usable order for the selected scenario. A failure only leaves the defaults in place.
   async function refreshOrders(selected: string | null) {
@@ -147,6 +144,7 @@ export function CreateRunForm({ onCreated }: { onCreated: (run: Run) => void }) 
         approval_threshold_paise: Number(thresholdRupees.trim()) * 100,
         require_manual_review: manualReview,
         faults: plan,
+        provider_status_down: !!statusDown,
       }, requestKey.current);
       requestKey.current = crypto.randomUUID();
       onCreated(run);
@@ -251,6 +249,10 @@ export function CreateRunForm({ onCreated }: { onCreated: (run: Run) => void }) 
             </select>
           </div>
         ))}
+        <label className="checkbox">
+          <input type="checkbox" checked={!!statusDown} onChange={(e) => edit({ statusDown: e.target.checked })} />
+          Provider status lookup is down
+        </label>
       </details>
 
       {activeFaults.length > 0 && (
