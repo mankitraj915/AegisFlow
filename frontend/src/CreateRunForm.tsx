@@ -1,15 +1,23 @@
-import { useState, type FormEvent } from "react";
-import { api, messageOf, PIPELINE, type FaultKind, type Run } from "./api";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { api, messageOf, PIPELINE, type FaultKind, type OrderKind, type Run } from "./api";
 
-// Mock orders seeded in backend/aegisflow/tools.py (ORDERS). Suggestions only;
-// any id is sent and the backend answers 404 for unknown orders.
-const DEMO_ORDERS = [
-  ["ORD-1001", "₹1,299 · under default threshold"],
-  ["ORD-2002", "₹12,000 · over default threshold"],
-  ["ORD-3003", "₹499 · flagged for manual review"],
-  ["ORD-4004", "₹5,000 · exactly at default threshold"],
-  ["ORD-9009", "cancelled · not refundable"],
-];
+// Mock orders are seeded in backend/aegisflow/demo_data.py, and each can be refunded
+// only up to its total, so the suggestions come from the server: the next order of
+// each kind with something left. Any id can still be typed; unknown ones get a 404.
+const FIRST_ORDER: Record<OrderKind, string> = {
+  under_threshold: "ORD-1001",
+  over_threshold: "ORD-2002",
+  manual_review: "ORD-3003",
+  at_threshold: "ORD-4004",
+  cancelled: "ORD-9009",
+};
+const ORDER_NOTES: Record<OrderKind, string> = {
+  under_threshold: "₹1,299 · under default threshold",
+  over_threshold: "₹12,000 · over default threshold",
+  manual_review: "₹499 · flagged for manual review",
+  at_threshold: "₹5,000 · exactly at default threshold",
+  cancelled: "cancelled · not refundable",
+};
 
 // Per-attempt fault plans. The engine retries up to 3 attempts in total.
 const FAULT_PRESETS: Record<string, { label: string; plan: FaultKind[] }> = {
@@ -33,42 +41,48 @@ interface Config {
 }
 
 // Each scenario is only a form configuration of behavior the backend supports.
-const SCENARIOS: { key: string; title: string; what: string; config: Config }[] = [
+const SCENARIOS: { key: string; title: string; what: string; kind: OrderKind; config: Omit<Config, "orderId"> }[] = [
   {
     key: "complete",
     title: "Clean completion",
-    what: "ORD-1001, ₹1,299. All six steps succeed without approval.",
-    config: { orderId: "ORD-1001", thresholdRupees: "5000", manualReview: false, faults: {} },
+    what: "A ₹1,299 order. All six steps succeed without approval.",
+    kind: "under_threshold",
+    config: { thresholdRupees: "5000", manualReview: false, faults: {} },
   },
   {
     key: "approval",
     title: "Approval required",
-    what: "ORD-2002, ₹12,000 is over the ₹5,000 threshold, so the run pauses before the refund.",
-    config: { orderId: "ORD-2002", thresholdRupees: "5000", manualReview: false, faults: {} },
+    what: "A ₹12,000 order is over the ₹5,000 threshold, so the run pauses before the refund.",
+    kind: "over_threshold",
+    config: { thresholdRupees: "5000", manualReview: false, faults: {} },
   },
   {
     key: "retry",
     title: "Retry after commit",
     what: "The refund commits, then times out once. The retry reuses the key: one ledger entry.",
-    config: { orderId: "ORD-1001", thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "commit_once" } },
+    kind: "under_threshold",
+    config: { thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "commit_once" } },
   },
   {
     key: "unknown",
     title: "Outcome unknown",
     what: "The refund times out after commit on all 3 attempts. The run fails with its outcome unknown.",
-    config: { orderId: "ORD-1001", thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "commit_exhaust" } },
+    kind: "under_threshold",
+    config: { thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "commit_exhaust" } },
   },
   {
     key: "interrupt",
     title: "Interruption and resume",
     what: "The run stops after the ledger write, before the step is recorded. Resume it to finish.",
-    config: { orderId: "ORD-1001", thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "interrupt" } },
+    kind: "under_threshold",
+    config: { thresholdRupees: "5000", manualReview: false, faults: { issue_refund: "interrupt" } },
   },
   {
     key: "policy",
     title: "Policy failure",
     what: "ORD-9009 was cancelled, so the policy check fails the run before any refund.",
-    config: { orderId: "ORD-9009", thresholdRupees: "5000", manualReview: false, faults: {} },
+    kind: "cancelled",
+    config: { thresholdRupees: "5000", manualReview: false, faults: {} },
   },
 ];
 
@@ -76,21 +90,43 @@ type Errors = { order?: string; threshold?: string; submit?: string };
 
 export function CreateRunForm({ onCreated }: { onCreated: (run: Run) => void }) {
   const [scenario, setScenario] = useState<string | null>("complete");
-  const [config, setConfig] = useState<Config>(SCENARIOS[0].config);
+  const [config, setConfig] = useState<Config>({ ...SCENARIOS[0].config, orderId: FIRST_ORDER[SCENARIOS[0].kind] });
+  const [available, setAvailable] = useState<Partial<Record<OrderKind, string>>>({});
+  // Kept across a failed submit, so retrying after a lost response can't create a second run.
+  const requestKey = useRef(crypto.randomUUID());
   const [errors, setErrors] = useState<Errors>({});
   const [submitting, setSubmitting] = useState(false);
   const { orderId, thresholdRupees, manualReview, faults } = config;
 
-  // Any manual edit turns the selection into a custom configuration.
+  // Picks the next usable order for the selected scenario. A failure only leaves the defaults in place.
+  async function refreshOrders(selected: string | null) {
+    try {
+      const next = Object.fromEntries((await api.availableOrders()).map((o) => [o.kind, o.id]));
+      setAvailable(next);
+      const kind = SCENARIOS.find((s) => s.key === selected)?.kind;
+      if (kind && next[kind]) setConfig((c) => ({ ...c, orderId: next[kind] }));
+    } catch {
+      setAvailable({});
+    }
+  }
+
+  useEffect(() => {
+    void refreshOrders("complete");
+  }, []);
+
+  // Any manual edit turns the selection into a custom configuration, and a new request.
   const edit = (patch: Partial<Config>) => {
     setConfig({ ...config, ...patch });
     setScenario(null);
+    requestKey.current = crypto.randomUUID();
   };
 
   function choose(key: string) {
-    setConfig(SCENARIOS.find((s) => s.key === key)!.config);
+    const chosen = SCENARIOS.find((s) => s.key === key)!;
+    setConfig({ ...chosen.config, orderId: available[chosen.kind] ?? FIRST_ORDER[chosen.kind] });
     setScenario(key);
     setErrors({});
+    requestKey.current = crypto.randomUUID();
   }
 
   async function submit(e: FormEvent) {
@@ -111,8 +147,10 @@ export function CreateRunForm({ onCreated }: { onCreated: (run: Run) => void }) 
         approval_threshold_paise: Number(thresholdRupees.trim()) * 100,
         require_manual_review: manualReview,
         faults: plan,
-      });
+      }, requestKey.current);
+      requestKey.current = crypto.randomUUID();
       onCreated(run);
+      void refreshOrders(scenario);
     } catch (err) {
       setErrors({ submit: messageOf(err) });
     } finally {
@@ -161,9 +199,9 @@ export function CreateRunForm({ onCreated }: { onCreated: (run: Run) => void }) 
             spellCheck={false}
           />
           <datalist id="demo-orders">
-            {DEMO_ORDERS.map(([id, note]) => (
-              <option key={id} value={id}>
-                {note}
+            {(Object.keys(ORDER_NOTES) as OrderKind[]).map((kind) => (
+              <option key={kind} value={available[kind] ?? FIRST_ORDER[kind]}>
+                {ORDER_NOTES[kind]}
               </option>
             ))}
           </datalist>

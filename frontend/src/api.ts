@@ -114,11 +114,27 @@ function errorMessage(status: number, body: unknown): string {
 
 const post = (body: unknown): RequestInit => ({ method: "POST", body: JSON.stringify(body) });
 
+export interface AvailableOrder {
+  id: string;
+  kind: OrderKind;
+  remaining_paise: number;
+}
+
+export type OrderKind = "under_threshold" | "over_threshold" | "manual_review" | "at_threshold" | "cancelled";
+
 export const api = {
   listRuns: () => request<Run[]>("/runs"),
   getRun: (id: string) => request<RunDetail>(`/runs/${encodeURIComponent(id)}`),
   listEvents: (id: string) => request<RunEvent[]>(`/runs/${encodeURIComponent(id)}/events`),
-  createRun: (order_id: string, scenario: Scenario) => request<Run>("/runs", post({ order_id, scenario })),
+  // The same key on a repeated request returns the original run, so a retry after a lost response can't create another.
+  createRun: (order_id: string, scenario: Scenario, idempotencyKey: string) => {
+    const init = post({ order_id, scenario });
+    return request<Run>("/runs", {
+      ...init,
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+    });
+  },
+  availableOrders: () => request<AvailableOrder[]>("/orders/available"),
   approve: (id: string, decided_by: string) =>
     request<Run>(`/runs/${encodeURIComponent(id)}/approve`, post({ decided_by })),
   resume: (id: string) => request<Run>(`/runs/${encodeURIComponent(id)}/resume`, { method: "POST" }),
