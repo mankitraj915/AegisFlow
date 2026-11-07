@@ -33,6 +33,7 @@ class Proc:
         self.gate.acquire()
         self.conns: list = []
         self.readonly = False
+        self.schema_current_at_open = False
         self.claims: dict[str, int] = {}
 
 

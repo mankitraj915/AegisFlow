@@ -91,9 +91,13 @@ class Checker:
         self._reset_snapshot()
         self.committed(None)
 
+    def opened(self, proc: Proc) -> None:
+        # A connection arriving before the schema exists may have to create it.
+        version = self.world.keeper.execute("PRAGMA user_version").fetchone()[0]
+        proc.schema_current_at_open = version == db.SCHEMA_VERSION
+
     def statement(self, proc: Proc, verb: str) -> None:
-        schema_current = self.world.keeper.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
-        if proc.readonly and verb in WRITE_VERBS and schema_current:  # Someone has to create it first.
+        if proc.readonly and verb in WRITE_VERBS and proc.schema_current_at_open:
             self.fail("read_path_writes", f"{proc.name} ran {verb} on a read-only path")
 
     def external_changed(self) -> None:
