@@ -6,7 +6,8 @@ they write to the mock external system in its own committed transaction, keyed s
 that a repeated call changes nothing, like a real provider's idempotency keys.
 
 The engine invokes tools through call(), which applies the scenario's
-deterministic fault plan for the given attempt.
+deterministic fault plan for the given attempt, and asks what really happened
+through lookup(), which never changes anything at the provider.
 """
 import sqlite3
 from collections.abc import Callable
@@ -94,6 +95,13 @@ class SqlLedger:
         except sqlite3.IntegrityError as exc:
             raise ToolError(f"ledger refused {amount} paise for {order_id}: {exc}") from exc
 
+    def refund_status(self, key: str) -> dict | None:
+        """What the provider holds under this key, or None if it has no record."""
+        row = self.conn.execute(
+            "SELECT order_id, amount_paise FROM refunds WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+        return dict(row) if row else None
+
     def refunded_totals(self) -> dict[str, int]:
         rows = self.conn.execute("SELECT order_id, SUM(amount_paise) AS total FROM refunds GROUP BY order_id")
         return {row["order_id"]: row["total"] for row in rows}
@@ -109,6 +117,12 @@ class SqlLedger:
                 "VALUES (?,?,?,?)",
                 (key, to, message, now()),
             ).rowcount == 1
+
+    def message_status(self, key: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT recipient, message FROM notifications WHERE idempotency_key = ?", (key,)
+        ).fetchone()
+        return dict(row) if row else None
 
 
 def _ledger(conn):
@@ -127,19 +141,49 @@ def available_orders(conn) -> list[dict]:
     return list(found.values())
 
 
-def issue_refund(conn: sqlite3.Connection, key: str, state) -> dict:
+def _refund_output(key: str, state) -> dict:
     proposal = state["outputs"]["propose_refund"]
-    order_id, amount = proposal["order_id"], proposal["amount_paise"]
-    _ledger(conn).issue(key, order_id, amount)
-    return {"refund_id": key, "order_id": order_id, "amount_paise": amount}
+    return {"refund_id": key, "order_id": proposal["order_id"], "amount_paise": proposal["amount_paise"]}
+
+
+def _message_output(key: str, state) -> dict:
+    refund = state["outputs"]["issue_refund"]
+    return {
+        "channel": "email",
+        "to": state["outputs"]["fetch_customer"]["email"],
+        "message": f"Your refund of {refund['amount_paise']} paise for {refund['order_id']} has been issued.",
+    }
+
+
+def issue_refund(conn: sqlite3.Connection, key: str, state) -> dict:
+    output = _refund_output(key, state)
+    _ledger(conn).issue(key, output["order_id"], output["amount_paise"])
+    return output
 
 
 def notify_customer(conn, key, state):
-    customer = state["outputs"]["fetch_customer"]
-    refund = state["outputs"]["issue_refund"]
-    message = f"Your refund of {refund['amount_paise']} paise for {refund['order_id']} has been issued."
-    _ledger(conn).send_message(key, customer["email"], message)
-    return {"channel": "email", "to": customer["email"], "message": message}
+    output = _message_output(key, state)
+    _ledger(conn).send_message(key, output["to"], output["message"])
+    return output
+
+
+def _refund_status(conn, key, state) -> dict | None:
+    record = _ledger(conn).refund_status(key)
+    if record is None:
+        return None
+    output = _refund_output(key, state)
+    if (record["order_id"], record["amount_paise"]) != (output["order_id"], output["amount_paise"]):
+        raise ToolError(f"provider holds {record['order_id']}/{record['amount_paise']} under {key}, "
+                        f"not {output['order_id']}/{output['amount_paise']}")
+    return output
+
+
+def _message_status(conn, key, state) -> dict | None:
+    return _message_output(key, state) if _ledger(conn).message_status(key) else None
+
+
+EXPECTED_OUTPUT: dict[str, Callable] = {"issue_refund": _refund_output, "notify_customer": _message_output}
+STATUS: dict[str, Callable] = {"issue_refund": _refund_status, "notify_customer": _message_status}
 
 
 TOOLS: dict[str, Callable] = {
@@ -150,6 +194,14 @@ TOOLS: dict[str, Callable] = {
     "issue_refund": issue_refund,
     "notify_customer": notify_customer,
 }
+
+
+def lookup(conn, name: str, key: str, state) -> dict | None:
+    """Ask the provider what it did under this key: the step's output if the effect
+    happened, None if it has no record of one. Raises if it can't say."""
+    if state["scenario"].get("provider_status_down"):
+        raise RetryableToolError("injected: provider status lookup unavailable")
+    return runtime.current.lookup(name, key, lambda: STATUS[name](conn, key, state))
 
 
 def call(conn, name: str, key: str, state, attempt: int) -> dict:

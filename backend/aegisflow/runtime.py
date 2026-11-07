@@ -32,6 +32,10 @@ def _invoke(name: str, key: str, call: Callable[[], dict]) -> dict:
     return call()
 
 
+def _lookup(name: str, key: str, call: Callable[[], dict | None]) -> dict | None:
+    return call()
+
+
 @dataclass
 class Runtime:
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
@@ -40,6 +44,8 @@ class Runtime:
     open_db: Callable[[str], Any] = _open_db
     # Wraps each tool call: invoke(tool name, idempotency key, call the tool).
     invoke: Callable[[str, str, Callable[[], dict]], dict] = _invoke
+    # Wraps each status lookup at the external system, the same way.
+    lookup: Callable[[str, str, Callable[[], dict | None]], dict | None] = _lookup
     # The external system, given the engine's connection. None: that same database.
     ledger: Callable[[Any], Any] | None = None
 
