@@ -1,6 +1,7 @@
 import sqlite3
 from contextlib import contextmanager
-from datetime import UTC, datetime
+
+from . import runtime
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -69,7 +70,7 @@ CREATE TABLE IF NOT EXISTS refunds (
 
 
 def now() -> str:
-    return datetime.now(UTC).isoformat()
+    return runtime.current.clock().isoformat()
 
 
 def connect(path: str) -> sqlite3.Connection:

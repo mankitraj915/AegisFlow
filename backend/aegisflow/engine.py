@@ -24,13 +24,11 @@ than any advance() takes under RETRY_POLICY.
 """
 import json
 import sqlite3
-import time
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
-from . import planner, tools
+from . import planner, runtime, tools
 from .db import now, tx
 from .models import (
     ApprovalOut,
@@ -58,8 +56,11 @@ class RetryPolicy:
 
 
 RETRY_POLICY = RetryPolicy()
-_sleep = time.sleep  # Test seam: replaced so tests never really wait.
 LEASE_S = 60
+
+
+def _sleep(seconds: float) -> None:  # Test seam: replaced so tests never really wait.
+    runtime.current.sleep(seconds)
 
 
 class RunNotFound(Exception):
@@ -113,12 +114,13 @@ def _load_state(conn, run) -> dict:
 
 def _claim(conn, run_id: str) -> str:
     """Take the run's lease or raise Conflict. Must be called inside tx()."""
-    token = uuid.uuid4().hex
-    expires = (datetime.now(UTC) + timedelta(seconds=LEASE_S)).isoformat()
+    token = runtime.current.new_id()
+    claimed_at = now()
+    expires = (datetime.fromisoformat(claimed_at) + timedelta(seconds=LEASE_S)).isoformat()
     claimed = conn.execute(
         "UPDATE runs SET lease_token=?, lease_expires_at=? "
         "WHERE id=? AND (lease_token IS NULL OR lease_expires_at < ?)",
-        (token, expires, run_id, now()),
+        (token, expires, run_id, claimed_at),
     ).rowcount
     if not claimed:
         raise Conflict(f"run {run_id} is already being advanced")
@@ -140,7 +142,7 @@ def _drive(conn, run_id: str, token: str, hook: Hook | None) -> str:
 def start_run(conn, order_id: str, scenario: Scenario, hook: Hook | None = None) -> str:
     if not tools.order_exists(order_id):
         raise OrderNotFound(order_id)
-    run_id = uuid.uuid4().hex
+    run_id = runtime.current.new_id()
     with tx(conn):
         conn.execute(
             "INSERT INTO runs(id, order_id, scenario_json, status, created_at, updated_at) VALUES (?,?,?,?,?,?)",
