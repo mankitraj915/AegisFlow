@@ -339,6 +339,6 @@ class Checker:
                       f"succeeded {sorted(succeeded)}")
             return
         for idx, state in checkpoints.items():
-            want = {s["name"]: json.loads(s["output_json"]) for i, s in steps.items() if i <= idx}
+            want = {s["name"]: json.loads(s["output_json"]) for i, s in steps.items() if i <= idx and s["output_json"]}
             if state["outputs"] != want:
                 self.fail("checkpoint_mismatch", f"{run_id[:8]} checkpoint {idx} disagrees with its steps")
