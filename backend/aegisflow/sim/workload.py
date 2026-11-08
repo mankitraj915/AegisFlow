@@ -30,11 +30,11 @@ FAULT_RATES: dict[str, tuple[float, float]] = {
 }
 # Workload shapes, switched per seed like faults.
 SHAPES = ("duplicate_commands", "scenario_faults", "readers", "stale_operators", "provider_forgets",
-          "recovery_worker", "poison_step", "http_layer")
+          "recovery_worker", "poison_step", "http_layer", "large_workload")
 # Newer features draw from a stream of their own, so adding one leaves each seed's other draws alone.
 SIDE_FEATURES = ("provider_false_error", "provider_stale_response", "status_unavailable", "provider_forgets",
-                 "recovery_worker", "poison_step", "http_layer")
-FEATURES = tuple(f for f in (*FAULT_RATES, *SHAPES) if f not in SIDE_FEATURES)
+                 "recovery_worker", "poison_step", "http_layer", "large_workload")
+FEATURES = (*FAULT_RATES, *SHAPES)
 # How long a forgetful provider remembers a key, and how long an outage can age a run.
 RETENTION_S = (310, 700)
 LONG_OUTAGE_S = 800
@@ -95,7 +95,7 @@ def make_plan(seed: int, only: set[str] | None = None, without: set[str] | froze
     rng = random.Random(f"{seed}:plan")
     # Swarm testing: each seed runs a random subset of faults, so one fault's
     # failures can't always mask the rarer path that another fault needs.
-    enabled = {f for f in FEATURES if rng.random() < 0.4}
+    enabled = {f for f in FEATURES if f not in SIDE_FEATURES and rng.random() < 0.4}
     rates = {f: rng.uniform(*span) for f, span in FAULT_RATES.items() if f not in SIDE_FEATURES}
     stickiness = rng.choice([0.0, 0.5, 0.9])
     side = random.Random(f"{seed}:side")
@@ -138,6 +138,13 @@ def make_plan(seed: int, only: set[str] | None = None, without: set[str] | froze
     # waits until nothing is in flight: a person guessing mid-outage can be wrong in ways no engine can catch.
     if side.random() < 0.5 and {"status_unavailable", "provider_forgets", "scenario_faults"} & enabled:
         commands.append(Command("operate", _when(side), action="reconcile", pick=side.random()))
+    if "large_workload" in enabled:
+        for i in range(side.randint(4, 9)):
+            at = _when(side)
+            order, scenario = side.choices(ORDERS, weights)[0], _scenario(side, "scenario_faults" in enabled)
+            commands.append(Command("create", at, order, scenario, request_id=f"big-{i}"))
+            commands.append(Command("operate", _when(side), action=side.choice(["resume", "approve", "reject"]),
+                                    pick=side.random()))
     if "http_layer" in enabled:
         keyless = {f"req-{i}" for i in range(4) if side.random() < 0.3}
         for command in commands:

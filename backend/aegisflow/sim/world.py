@@ -402,7 +402,9 @@ class World:
         self.faults_on = False
         db.ensure_schema(self.keeper)  # A crash may have beaten every connect() to it.
         self.sched.true_us += self.plan.outage_us  # Nobody looks at the system for a while.
-        for number in range(OPERATOR_ROUNDS):
+        # Each run with a poisoned step can use up rounds of its own getting to its crash bound,
+        # one at a time, since it kills whoever reaches it first. Stuck stays stuck however long this is.
+        for number in range(OPERATOR_ROUNDS + (engine.MAX_CRASHES + 1) * len(self.unfinished())):
             if not self.unfinished():
                 return
             self.sched.true_us += (engine.LEASE_S + 1) * 1_000_000  # Abandoned leases expire.

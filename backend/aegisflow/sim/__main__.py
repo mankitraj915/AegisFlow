@@ -98,9 +98,11 @@ def cmd_controls(args) -> int:
         started = time.perf_counter()
         caught = None
         other: set[str] = set()
+        # Swarm: each seed's own random subset of features. All: every feature on, every time.
+        only = set(FEATURES) if args.mode == "all" else None
         with applied(name):
             for seed in range(args.start, args.start + args.max_seeds):
-                found = simulate(seed).invariants()
+                found = simulate(seed, only).invariants()
                 hits = found & set(mutation.catches)
                 other |= found - hits
                 if hits:
@@ -143,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     controls.add_argument("--name", action="append", choices=sorted(MUTATIONS), help="only this control (repeatable)")
     controls.add_argument("--max-seeds", type=int, default=2000)
     controls.add_argument("--start", type=int, default=0)
+    controls.add_argument("--mode", choices=["swarm", "all"], default="swarm", help="which features each seed gets")
     controls.set_defaults(fn=cmd_controls)
 
     args = parser.parse_args(argv)

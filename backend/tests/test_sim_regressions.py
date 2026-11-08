@@ -12,23 +12,23 @@ from aegisflow.sim.run import simulate
 
 # (control, seed, invariant it breaks)
 ENGINE_BUGS = [
-    ("lose_outcome_unknown", 855, "unknown_reported_as_failure"),  # P1
-    ("no_fencing", 268, "history_mismatch"),  # P2
-    ("no_order_cap", 32, "refund_cap"),  # P3
-    ("ignore_request_key", 1, "request_ran_twice"),  # P3
-    ("volatile_backoff", 1556, "backoff_skipped"),  # P4
+    ("lose_outcome_unknown", 439, "unknown_reported_as_failure"),  # P1
+    ("no_fencing", 102, "history_mismatch"),  # P2
+    ("no_order_cap", 8, "refund_cap"),  # P3
+    ("ignore_request_key", 26, "request_ran_twice"),  # P3
+    ("volatile_backoff", 142, "backoff_skipped"),  # P4
     ("write_on_connect", 2, "read_path_writes"),  # P5
-    ("notify_ignores_key", 19, "notified_twice"),  # P6
+    ("notify_ignores_key", 14, "notified_twice"),  # P6
     ("create_reports_conflict", 34, "api_contract"),
-    ("hide_committed_effects", 36, "undisclosed_effect_before_failure"),  # P7
+    ("hide_committed_effects", 4, "undisclosed_effect_before_failure"),  # P7
 ]
 
 # The bug classes the design has to rule out.
 CLASSES = [
     ("skip_idempotency_check", 5, "ledger_mismatch"),
-    ("skip_idempotency_check_and_cap", 18, "refund_cap"),
-    ("record_progress_first", 6, "succeeded_without_effect"),
-    ("drop_fsync", 12, "ack_lost"),
+    ("skip_idempotency_check_and_cap", 8, "refund_cap"),
+    ("record_progress_first", 1, "succeeded_without_effect"),
+    ("drop_fsync", 1, "ack_lost"),
 ]
 
 
@@ -47,8 +47,8 @@ def test_discovery_seeds_stay_clean(seed):
 
 
 # Checker mistakes the simulator exposed: (mistake, seed that reported a false failure).
-@pytest.mark.parametrize("mistake,seed", [("backoff_timed_from_commit", 1556), ("schema_judged_per_statement", 34),
-                                                  ("lease_timed_from_restart", 424)])
+@pytest.mark.parametrize("mistake,seed", [("backoff_timed_from_commit", 1750), ("schema_judged_per_statement", 4),
+                                                  ("lease_timed_from_restart", 1)])
 def test_seed_that_exposed_a_checker_mistake_stays_clean(mistake, seed):
     assert simulate(seed).failures() == []
     with applied(mistake):
