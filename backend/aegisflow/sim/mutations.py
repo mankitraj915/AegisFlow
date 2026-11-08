@@ -44,6 +44,10 @@ _NO_CAP_TRIGGER = (
     ("aegisflow.db", "WHEN COALESCE((SELECT SUM", "WHEN 0 AND COALESCE((SELECT SUM"),
 )
 
+# Believing an error: what shows up is money or a message going out twice, or a reported failure that wasn't.
+_BELIEVED_THE_ERROR = ("effect_duplicated", "notified_twice", "refund_cap", "ledger_mismatch",
+                       "unknown_reported_as_failure")
+
 MUTATIONS = {m.name: m for m in (
     # The three the brief names.
     Mutation("skip_idempotency_check", "the ledger ignores the idempotency key",
@@ -94,6 +98,52 @@ MUTATIONS = {m.name: m for m in (
              ("api_contract",),
              (("aegisflow.engine", "    except Conflict:\n        pass  # Someone else",
                "    except ZeroDivisionError:\n        pass  # Someone else"),)),
+    # Each new guarantee, taken away again.
+    Mutation("no_reconciliation", "nothing ever asks the provider what really happened",
+             _BELIEVED_THE_ERROR,
+             (("aegisflow.engine", "    try:\n        output = tools.lookup(conn, name, key, state)",
+               "    return ProviderView()\n    try:\n        output = tools.lookup(conn, name, key, state)"),)),
+    Mutation("retry_before_reconcile", "a step is called again before the provider is asked",
+             _BELIEVED_THE_ERROR,
+             (("aegisflow.engine", "if name in tools.SIDE_EFFECTING:\n                view = _ask_provider",
+               "if False:\n                view = _ask_provider"),)),
+    Mutation("unknown_as_failure", "what the lookup can't settle is reported as a plain failure",
+             ("unknown_reported_as_failure", "ledger_mismatch"),
+             (("aegisflow.engine",
+               'return _hold_for_review(conn, run_id, epoch, idx, name, key, f"{error}; {view.doubt}")',
+               'return _fail(conn, run_id, epoch, idx, name, f"{error}; {view.doubt}", info)'),)),
+    Mutation("trust_forgotten_keys", "no record is believed however old the key is",
+             _BELIEVED_THE_ERROR,
+             (("aegisflow.engine", "if age >= KEY_TRUST_S:", "if False:"),)),
+    Mutation("no_crash_loop_bound", "a step that keeps killing its driver is resumed forever",
+             ("crash_loop_unbounded", "stuck_run"),
+             (("aegisflow.engine", "if crashes >= MAX_CRASHES:", "if False:"),)),
+    Mutation("recovery_without_fencing", "taking over a run doesn't raise its fencing epoch",
+             ("stale_write", "history_mismatch", "integrity_error", "step_regressed", "terminal_changed"),
+             (("aegisflow.engine", 'epoch = _claim(conn, run_id)\n        pending = conn.execute(\n'
+               '            "SELECT idx, name, idempotency_key FROM steps WHERE run_id=? AND status=\'started\'", '
+               '(run_id,)\n        ).fetchone()\n        _event(conn, run_id, "run_recovered"',
+               'epoch = _claim(conn, run_id) - 1\n'
+               '        conn.execute("UPDATE runs SET lease_epoch=? WHERE id=?", (epoch, run_id))\n'
+               '        pending = conn.execute(\n'
+               '            "SELECT idx, name, idempotency_key FROM steps WHERE run_id=? AND status=\'started\'", '
+               '(run_id,)\n        ).fetchone()\n        _event(conn, run_id, "run_recovered"'),)),
+    Mutation("worker_ignores_lease", "the worker takes over runs whose drivers are still within their lease",
+             ("two_drivers",),
+             (("aegisflow.engine", '"lease_expires_at < ? OR (lease_token IS NULL AND "',
+               '"lease_expires_at >= ? OR (lease_token IS NULL AND "'),
+              ("aegisflow.engine", 'raise Conflict(f"run {run_id} is not waiting to be recovered")\n'
+               '        epoch = _claim(conn, run_id)',
+               'raise Conflict(f"run {run_id} is not waiting to be recovered")\n'
+               '        conn.execute("UPDATE runs SET lease_token=NULL WHERE id=?", (run_id,))\n'
+               '        epoch = _claim(conn, run_id)'))),
+    Mutation("worker_does_nothing", "the sweep never picks up an abandoned run",
+             ("stuck_run",),
+             (("aegisflow.recovery", "for run_id in engine.abandoned_runs(conn):", "for run_id in []:"),)),
+    Mutation("api_ignores_idempotency", "POST /runs drops the Idempotency-Key header before the engine sees it",
+             ("request_ran_twice", "api_contract"),
+             (("aegisflow.api", "body.order_id, body.scenario, idempotency_key)",
+               "body.order_id, body.scenario, None)"),)),
     # Other claims the checker makes.
     Mutation("no_backoff", "retries fire immediately", ("backoff_skipped",),
              (("aegisflow.engine",
@@ -107,7 +157,8 @@ MUTATIONS = {m.name: m for m in (
                'output = tools.call(conn, name, f"{key}:{attempt}", state, attempt)'),)),
     Mutation("no_lease_exclusion", "any caller can claim a run another driver holds",
              # Fencing still protects the data, so what's left to see is a displaced driver's backoff going unserved.
-             ("stale_write", "history_mismatch", "integrity_error", "step_regressed", "backoff_skipped"),
+             ("two_drivers", "stale_write", "history_mismatch", "integrity_error", "step_regressed",
+              "backoff_skipped"),
              (("aegisflow.engine", "WHERE id=? AND (lease_token IS NULL OR lease_expires_at < ?)",
                "WHERE id=? AND (1 OR lease_expires_at < ?)"),)),
     Mutation("no_approval_gate", "refunds over the threshold skip approval", ("gate_bypassed",),

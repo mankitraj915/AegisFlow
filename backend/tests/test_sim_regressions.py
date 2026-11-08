@@ -23,6 +23,19 @@ ENGINE_BUGS = [
     ("hide_committed_effects", 4, "undisclosed_effect_before_failure"),  # P7
 ]
 
+# Each guarantee added with reconciliation, recovery and the HTTP layer, taken away again.
+GUARANTEES = [
+    ("no_reconciliation", 5, "ledger_mismatch"),
+    ("retry_before_reconcile", 12, "notified_twice"),
+    ("unknown_as_failure", 12, "unknown_reported_as_failure"),
+    ("trust_forgotten_keys", 12, "notified_twice"),
+    ("no_crash_loop_bound", 7, "crash_loop_unbounded"),
+    ("recovery_without_fencing", 32, "integrity_error"),
+    ("worker_ignores_lease", 1, "two_drivers"),
+    ("worker_does_nothing", 1, "stuck_run"),
+    ("api_ignores_idempotency", 27, "api_contract"),
+]
+
 # The bug classes the design has to rule out.
 CLASSES = [
     ("skip_idempotency_check", 5, "ledger_mismatch"),
@@ -32,7 +45,7 @@ CLASSES = [
 ]
 
 
-@pytest.mark.parametrize("control,seed,invariant", ENGINE_BUGS + CLASSES)
+@pytest.mark.parametrize("control,seed,invariant", ENGINE_BUGS + GUARANTEES + CLASSES)
 def test_seed_passes_fixed_and_fails_with_the_bug_back(control, seed, invariant):
     assert simulate(seed).failures() == []
     with applied(control):
