@@ -99,7 +99,8 @@ class World:
         return runtime.Runtime(
             clock=self._clock,
             new_id=lambda: f"{self._ids.getrandbits(128):032x}",
-            sleep=lambda seconds: self.sched.sleep_us(int(seconds * 1_000_000)),
+            # Rounded, not truncated: 0.008176 s is 8175.999... us in floating point.
+            sleep=lambda seconds: self.sched.sleep_us(round(seconds * 1_000_000)),
             open_db=self._open_db,
             invoke=self._invoke,
             lookup=self._lookup,

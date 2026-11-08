@@ -174,6 +174,10 @@ class Checker:
                 if event["type"] == "step_succeeded":
                     self.succeeded_at[step_key] = now
                 elif event["type"] == "step_attempt_failed":
+                    attempt = payload["attempt"]
+                    # Read again after a power loss: its backoff still runs from when it was first seen.
+                    if proc is None and any(a == attempt for _, _, a in self.failed_attempts[step_key]):
+                        continue
                     delay_us = int(payload["next_delay_s"] * 1_000_000)
                     # A backoff runs from when the engine read the clock to schedule it, just
                     # before this transaction, however long the commit then took.
