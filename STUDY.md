@@ -44,12 +44,12 @@ So an engine bug can't hide by agreeing with itself. The checker reads the datab
 The external system is outside the crash, and it counts deliveries per key. At the end, each run must have at most one refund, totals must stay within the order amount, a succeeded run must have its refund and message, and a failed run with a refund must disclose it.
 
 **How do you know the checker can actually fail?**
-The negative controls: 20 known bugs put back as exact source edits, each with a count of the seeds to catch it. See [docs/BUGS_FOUND.md](docs/BUGS_FOUND.md). They also exposed a workload gap and a checker crash.
+The negative controls: known bugs put back as exact source edits, each with a count of the seeds to catch it. There were 20 at the end of this stage and there are 30 now. See [docs/BUGS_FOUND.md](docs/BUGS_FOUND.md). They also exposed a workload gap and a checker crash.
 
 ## Stage 4: bugs and controls
 
 **What did the simulator find on its own?**
-No engine bugs. After the audit fixes, every failure it reported was a mistake in the checker: `read_path_writes` misjudging connections that opened before the schema existed, and `backoff_skipped` timing a backoff from the commit instead of the clock read. Saying that plainly is the point of the provenance split. Do not claim otherwise.
+At this stage, no engine bugs. After the audit fixes, every failure it reported was a mistake in the checker: `read_path_writes` misjudging connections that opened before the schema existed, and `backoff_skipped` timing a backoff from the commit instead of the clock read. Saying that plainly is the point of the provenance split. Do not claim otherwise. (Stage 6 has the one engine bug it later found on its own.)
 
 **The hardest question: why can't a crash between a side effect and its progress record cause a duplicate in this design?**
 Because the retry doesn't try a new effect. It repeats the same one, and the receiver can tell.
@@ -63,7 +63,7 @@ If the crash came *before* the insert, the same call performs it for the first t
 
 Three things this rests on, which a good interviewer will push on:
 
-- **The receiver has to deduplicate.** This is at-least-once delivery plus an idempotent receiver, not magic. A provider without keys, or one that forgets them too soon, breaks it. Here the provider is a mock.
+- **The receiver has to deduplicate.** This is at-least-once delivery plus an idempotent receiver, not magic. A provider without keys, or one that forgets them too soon, breaks it. Stage 6 is about what to do when it does forget.
 - **Recording progress first doesn't work.** That's the other order, and it loses the effect rather than duplicating it. The `record_progress_first` control shows this: 9 seeds to catch.
 - **Concurrency doesn't change the argument.** A stale driver mid-call and its replacement use the same key, because the key belongs to the step, not to the driver. The epoch fences database writes, and the key covers the external call, which can't be fenced.
 
@@ -78,8 +78,43 @@ Discovery seeds stop reaching the same code once the workload or the engine chan
 **What exactly is claimed, and what isn't?**
 Claimed: within the fault model and the workload, across the seeds reported, no invariant was violated, and each control was caught within a stated number of seeds. Not claimed: formal proof, uptime, performance, real-provider behaviour, or behaviour on real disks.
 
-**What are the weakest points?**
-Fsync is modelled, not observed. WAL checkpoint crashes aren't covered. The external system is a mock that honours keys perfectly. The invariants share an author with the engine. The workload is small, at most a few runs per seed. There are no real parallel processes except one process-death test.
+**What were the weakest points at this stage?**
+Fsync is modelled, not observed. WAL checkpoint crashes aren't covered. The external system was a mock that honoured keys perfectly. The invariants share an author with the engine. The workload was small, at most a few runs per seed. Recovery was manual and crash loops unbounded. The simulator never went through HTTP. There are no real parallel processes except the process-death tests. Stage 6 took on the provider, recovery, crash loops, HTTP and workload size. The rest still stand.
 
 **Explain fencing tokens in three sentences.**
 A lease can expire under a healthy driver, so the driver can't rely on still holding it. Each claim increments a number kept on the run, and every write checks that number in the same transaction as the write, so a replaced driver's writes change nothing. The clock decides when a takeover may happen, and only the number decides whose writes count.
+
+## Stage 6: a less forgiving world
+
+**A refund succeeds, but the response is lost. What happens, and why must reconciliation come before the retry?**
+The provider has committed the refund under the step's key. The engine got an error and has no idea which side of the commit it failed on. Retrying under the same key is safe only if the provider still remembers that key. If it has forgotten it (real providers expire keys), the retry is a new request and pays a second time. Reporting `failed` is wrong too, since the money moved. So the engine asks first: it looks the key up through `runtime.current.lookup`. If the refund is there, the step is recorded as succeeded (`step_reconciled`) with no second call. If there's no record and the key is young enough that the provider can't have forgotten it, the retry is safe. If it's old, or the lookup fails, the run goes to `needs_review` with the key. Asking after the retry would be too late, because the retry is the thing that pays twice. `retry_before_reconcile` puts that order back and is caught as a second notification in 13 seeds.
+
+**Why isn't "no record" proof that the refund didn't happen?**
+Two reasons. A request may still be in flight and land after the lookup, and an old key may simply have been forgotten. So "no record" counts only as permission to retry a young key under the same key, never as grounds to report failure, except on a first attempt the provider refused outright.
+
+**What's `needs_review`, and how does a run leave it?**
+A hold for an outcome nobody can establish. No driver leaves it on its own. A later lookup that finds the effect (`reconcile`, which every recovery sweep tries) moves it on. Otherwise a person does (`resolve`): "it happened" carries on with the provider's output, or the expected one if the provider has forgotten. "It did not happen" fails the run, and it's refused while the provider shows the effect.
+
+**Where can a person still get it wrong?**
+While the lookup is down, nothing contradicts them. Found in the browser check, not by the simulator: "it did not happen" is accepted for a refund that's in the ledger. It's a limit of what software can know, and it's listed as one.
+
+**What does the recovery worker do, and why does it need the fencing token?**
+Each sweep resumes runs whose lease has expired, or that nobody claimed and have gone quiet, and asks again about held runs. It claims through the same `_claim` as everyone else, so it raises the epoch. A worker that stalls mid-recovery and is replaced writes nothing. `recovery_without_fencing` (claiming without raising the epoch) is caught in 33 seeds as an integrity error between two drivers.
+
+**Why does automatic recovery force a crash-loop bound?**
+Crashes don't use up retries, by design, so a step that kills its process every time would be resumed by every sweep, forever. Each step now carries an `executing` flag. Finding it set means the last driver died with no outcome, which counts as a crash. After 3, the run is `quarantined`, with its history and, for a side effect, `outcome_unknown`. Nothing resumes a quarantined run. `no_crash_loop_bound` is caught in 8 seeds.
+
+**What did going through HTTP find that the engine-level simulator couldn't?**
+An engine bug no one had predicted. `POST /runs` created the run, then drove it. A takeover in between came back as 409, so a client was told its successful request had failed. Calling the engine directly, a conflict looked like any other. Through the API, `api_contract` saw a create answered with a status the API doesn't document for success. Fixed in `15706ec`.
+
+**Did the simulator find the provider problems, or were they known?**
+Known. The previous report listed the perfectly honest provider as a weak point, so the adversarial provider was written to test a predicted weakness. Against the old engine (`9bed504`), 2,000 seeds found `undisclosed_effect_on_failed_step` in 29 and `notified_twice` in 3. That confirms the prediction. It isn't a blind discovery, and `docs/BUGS_FOUND.md` keeps it apart from what was.
+
+**The first scheduled 100,000-seed run failed three seeds. Was the engine wrong?**
+No. All three were `backoff_skipped` at `1629a8f`, and the traces showed the engine waiting out each stored backoff. Two were the checker reading events again after a power loss and timing old failures from the restart. That's the same mistake already made once for leases, which suggests checking every place the checker re-reads state after a restart. The third was the simulator sleeping 8,175 µs when asked for 8,176. The way to tell: reproduce at the failing commit, read the trace, find what time the checker compared against, and confirm the fix clears the seeds on the old code too. A regression test that fails on the old code (`test_sim_apparatus.py`) keeps it fixed. The next two nightly runs, still on `1629a8f`, failed 5 more seeds on `backoff_skipped`. All five pass with the same fix applied to that commit. The final survey then found a third case of the same kind: the checker timed a lease from the wrong clock read and missed a real forward jump. That was seed 2935, fixed in `45e07e7`.
+
+**Is swarm testing better than turning every fault on?**
+Not clearly, per seed. At `d4c7194`, over two 300-seed ranges, swarm caught 24 and 27 of the 30 controls, and all-faults-on caught 25 and 23. Swarm ran the whole set in 444 s and 287 s, all-on in 904 s and 941 s, because an all-on seed takes about twice as long. Each mode caught controls the other missed in that budget. So here, swarm is the better default per second, and all-on is a useful second pass. Two small ranges can't settle more than that.
+
+**What is still weak?**
+Fsync is modelled. WAL checkpoint crashes aren't covered. The provider's misbehaviour is what its author imagined. Key age is on the wall clock, so a backward jump could make a forgotten key look trustworthy: reasoned about, never reached by a seed. A person settling a held run can be wrong. The worker runs inside the API process, and on Render's free tier it sleeps with the service. Real parallel processes appear only in the process-death tests. The checker and the engine still share an author.

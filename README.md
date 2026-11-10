@@ -1,6 +1,6 @@
 # AegisFlow
 
-A small workflow runtime that issues refunds through six recorded steps and stays correct when things go wrong, tested by a deterministic simulator that runs the real engine through crashes, power loss, I/O errors, lost and duplicated messages and clock jumps, and replays any failure from its seed.
+A small workflow runtime that issues refunds through six recorded steps and stays correct when things go wrong, tested by a deterministic simulator that runs the real engine through crashes, power loss, I/O errors, lost and duplicated messages, clock jumps and a payment provider that lies and forgets, and replays any failure from its seed.
 
 **Live demo:** https://aegisflow-075f.onrender.com (shared simulation on Render's free tier; the first visit may take about a minute to wake the service)
 
@@ -12,29 +12,32 @@ The refunds, orders, payment ledger and notifications are all simulated. Nothing
 
 ## The claim, and how it's tested
 
-Under crashes at any seam, power loss, I/O errors, lost, delayed, duplicated and late messages, and clock jumps:
+Under crashes at any seam, power loss, I/O errors, lost, delayed, duplicated and late messages, clock jumps, and a provider that reports errors for work it did, answers with stale replies, has its status lookup go down and forgets old idempotency keys:
 
 - each step's side effect is applied at most once, and an order is never refunded past its total;
+- the ledger agrees with what the provider really did, and an outcome nobody can establish is held for review, never reported as a plain failure;
 - a finished run stays finished and is never re-run from scratch;
-- a driver that has been replaced can't write;
-- retries respect their limit and their backoff;
+- a run is taken from its driver only once that driver's lease is up, and a driver that has been replaced can't write;
+- every run ends `succeeded`, `failed`, `rejected` or `quarantined`, with the recovery worker or a person, not luck, getting it there;
+- retries respect their limit and their backoff, and a step that keeps crashing is stopped;
 - durable state matches the event history;
-- acknowledged work survives power loss, and a failed run says which effects committed.
+- acknowledged work survives power loss, and a failed run says which effects committed;
+- the HTTP API gives each request one run and answers only with the statuses it documents.
 
 This is systematic testing, not a formal proof. The evidence:
 
-- **A deterministic simulator** (`backend/aegisflow/sim/`). The real engine runs on baton-passing threads against real SQLite, and a seed decides the interleaving, the clock and the faults. The same seed gives the same run, byte for byte.
-- **A history checker** with 29 named invariants, which shares no logic with the engine.
-- **Negative controls.** 20 known bugs, put back as exact source edits. Each is caught within a stated number of seeds.
+- **A deterministic simulator** (`backend/aegisflow/sim/`). The real engine runs on baton-passing threads against real SQLite, and a seed decides the interleaving, the clock and the faults. Some seeds drive it through the real FastAPI app in process. The same seed gives the same run, byte for byte.
+- **A history checker** with 33 named invariants, which shares no logic with the engine.
+- **Negative controls.** 30 known bugs, put back as exact source edits. Each is caught within a stated number of seeds.
 - **Regression tests** pinning a seed per bug that passes on the fixed code and fails with the bug put back.
 
-**Latest results:** 20,000 seeds with no invariant violated (seeds 0 to 19999, commit `eb6cac7`), and all 20 controls caught, the slowest taking 4,413 seeds. Those are results for those seeds, not a guarantee about all of them.
+At `45e07e7`, all 30 controls were caught within 440 seeds (`controls --max-seeds 3000`, 202 s), and a survey of seeds 0 to 3,999 (631.4 s) fired no invariant. A clean range is evidence about those seeds, not proof that no bug remains.
 
 [WALKTHROUGH.md](WALKTHROUGH.md) explains how this works and where it stops. [STUDY.md](STUDY.md) has questions and answers by stage.
 
 ### Bugs found
 
-The audit found these by hand first. The simulator then re-found each one on the unfixed engine, with `survey --seeds 6000` at commit `005e746`. **After those fixes, it found no further engine bugs.** The failures it reported afterwards were mistakes in the checker. Details, schedules and the control results are in [docs/BUGS_FOUND.md](docs/BUGS_FOUND.md).
+The audit found these by hand first. The simulator then re-found each one on the unfixed engine, with `survey --seeds 6000` at commit `005e746`. After those fixes it found no engine bugs until the hardening work. Driving clients through the HTTP layer, it then found one nobody had predicted: `POST /runs` answered 409 for a run it had just created, if another driver took the run over before the reply (fixed in `15706ec`). Everything else it reported was a mistake in the checker, the workload or the simulator itself, including every seed the scheduled 100,000-seed runs failed, and one seed from the final survey. Details, schedules and the control results are in [docs/BUGS_FOUND.md](docs/BUGS_FOUND.md).
 
 | Audit | Bug | Seeds to re-find | Fix |
 |---|---|---:|---|
@@ -57,7 +60,7 @@ cd backend
 .venv\Scripts\python.exe -m aegisflow.sim controls                     # put known bugs back, count seeds to catch
 ```
 
-A failing seed prints a minimal `reproduce:` command. CI runs up to 5,000 seeds on a time budget on every push, and a nightly workflow covers a new seed range and can be started by hand for longer runs.
+A failing seed prints a minimal `reproduce:` command. CI runs up to 5,000 seeds on a 420 s budget on every push, and a nightly workflow covers a new seed range and can be started by hand for longer runs. `controls --mode all` turns every feature on for every seed, to compare with the default swarm mode.
 
 ## What it demonstrates
 
@@ -65,7 +68,9 @@ The interesting part is the window between "the payment system committed" and "t
 
 - **Stable idempotency keys.** Step *n* of a run always uses `{run_id}:{n}`. Retries and resumes reuse it. The ledger (written in its own transaction, as an external payment system would) replays a key it has already seen, and a reused key with a different order or amount is a fatal error.
 - **Re-entrant execution.** A step left `started` is simply run again under its key. Earlier completed steps are never repeated.
-- **Bounded, deterministic retries.** Transient faults retry up to 3 attempts in total (0.1 s, then 0.2 s; no jitter). The backoff is stored with the step, so whoever picks the step up waits out the rest of it. Fatal faults fail the run immediately. If a side-effecting step fails when its effect may have committed, the run fails with `outcome_unknown: true` and the key, instead of claiming success or failure. A run that fails later names the effects already committed.
+- **Bounded, deterministic retries.** Transient faults retry up to 3 attempts in total (0.1 s, then 0.2 s; no jitter). The backoff is stored with the step, so whoever picks the step up waits out the rest of it. A run that fails later names the effects already committed.
+- **Reconciliation before retry.** An error from the provider doesn't say whether the refund happened: the reply may have been lost, stale, or plain wrong. So before calling a side-effecting step again, and before reporting any error from one, the engine looks the key up with the provider. If the refund is there, the step is recorded as done (`step_reconciled`) with no second call. "No record" is trusted only while the key is under 5 minutes old (`KEY_TRUST_S`), which assumes the provider keeps keys longer than that, and only as grounds to retry under the same key, never as proof of failure. Anything the lookup can't settle puts the run in `needs_review` with the key. The recovery worker asks again on each sweep (so can **Re-check** in the UI), and a person can settle it with **It happened** or **It did not happen**. A person can't deny a refund the provider shows.
+- **Recovery without a person.** A background worker in the API process (every 30 s; `AEGISFLOW_RECOVERY_INTERVAL_S`, 0 turns it off) resumes runs whose driver's lease has expired. It takes the lease and the fencing token like any other driver. A step that kills its driver 3 times (`MAX_CRASHES`) puts the run in `quarantined`, which nothing resumes. Interrupted runs are left for a person, as the demo intends.
 - **Human approval.** Refunds strictly above the scenario threshold (default ₹5,000), or flagged for manual review, pause before `issue_refund`. Only the first decision applies; a second one gets HTTP 409.
 - **Single driver per run.** Starting, approving and resuming take a lease on the run inside a write transaction. A concurrent caller gets HTTP 409. A lease left by a killed process expires after 60 seconds. Expiry alone can't stop a stalled driver from carrying on, so each claim also increments a fencing token, and every write checks it in the same transaction.
 - **One run per request, one refund up to the total.** An optional `Idempotency-Key` on `POST /runs` maps a client request to one run. A database trigger refuses any refund that takes an order past its total.
@@ -94,7 +99,9 @@ You can reproduce three levels of failure, from simulated to real.
    - exactly one refund, step 4 still `started`, and the dead process's lease still held, so `resume` is refused with a conflict;
    - after the lease expiry time has passed (the test advances the engine's clock past 60 s rather than sleeping), `resume` succeeds, reuses the same key, leaves one refund, and produces the exact expected event sequence.
 
-Recovery after process death needs two things: the SQLite file must survive, and someone must call resume after the lease expires. Nothing resumes runs automatically.
+Recovery after process death needs the SQLite file to survive. With the API server up, its recovery worker picks the run up once the lease expires (`backend/tests/test_sweep.py`); without it, someone calls resume.
+
+The *Outcome unknown* preset shows the other side: the refund commits, the reply is lost, and the provider's status lookup is down, so the run stops in `needs_review` instead of guessing. The scenario keeps the lookup down, so **Re-check** keeps failing and a person has to settle it. While the lookup is down, nothing stops that person from answering **It did not happen** for a refund that did happen (see Limitations).
 
 ## Run it locally (Windows PowerShell)
 
@@ -157,11 +164,13 @@ The backend tests check behaviour and invariants: ledger rows, step and event hi
           sqlite3 file ◄┘       └──► storage.py    real SQLite, crash images, I/O faults
           tools.py ledger            world.py      faults, external system, clients
                                      workload.py   what each seed asks for
-                                     checker.py    29 invariants, watching from outside
+                                     asgi.py       clients calling the real FastAPI app
+                                     checker.py    33 invariants, watching from outside
                                      mutations.py  known bugs, as exact source edits
 ```
 
-- `aegisflow/engine.py`: run state machine, retries, approvals, leases, event log
+- `aegisflow/engine.py`: run state machine, retries, reconciliation, approvals, leases, quarantine, event log
+- `aegisflow/recovery.py`: one sweep of the recovery worker
 - `aegisflow/planner.py`: fixed six-step pipeline and approval policy
 - `aegisflow/tools.py`: deterministic mock tools and refund ledger; `demo_data.py`: the order pool
 - `aegisflow/db.py`: schema and migrations
@@ -185,11 +194,13 @@ Paths are relative to the API root: `http://127.0.0.1:8000` with `create_app`, o
 | POST | `/runs/{id}/approve` | `{decided_by}` |
 | POST | `/runs/{id}/reject` | `{decided_by, reason?}` |
 | POST | `/runs/{id}/resume` | Continue an interrupted `running` run (409 if not `running` or already being advanced) |
+| POST | `/runs/{id}/reconcile` | Ask the provider again about a `needs_review` run |
+| POST | `/runs/{id}/resolve` | `{decided_by, outcome}` with `applied` or `not_applied`: a person settles a `needs_review` run (409 for `not_applied` while the provider shows the effect) |
 | GET | `/health` | Liveness and database check |
 
 Runs execute synchronously: `POST /runs`, `/approve` and `/resume` return once the run has finished, failed, paused for approval or been interrupted.
 
-A scenario sets `approval_threshold_paise`, `require_manual_review` and `faults`, which maps a step name to the outcome of each attempt: `retryable`, `fatal`, `retryable_after_commit` or `interrupt_after_commit`.
+A scenario sets `approval_threshold_paise`, `require_manual_review`, `provider_status_down` and `faults`, which maps a step name to the outcome of each attempt: `retryable`, `fatal`, `retryable_after_commit` or `interrupt_after_commit`.
 
 ### Demo orders
 
@@ -212,17 +223,19 @@ An order can be refunded only up to its total, so the demo seeds a pool of each 
 | `AEGISFLOW_DB` | `aegisflow.db` in the current directory | SQLite file path |
 | `AEGISFLOW_MAX_RUNS` | unlimited | Run cap for the public demo |
 | `AEGISFLOW_FRONTEND_DIST` | `frontend/dist` in the source tree | Built UI served by `create_site` |
+| `AEGISFLOW_RECOVERY_INTERVAL_S` | `30` | Seconds between recovery sweeps; `0` turns the worker off |
 
 ## Limitations
 
 - **Fsync behaviour is modelled, not observed.** Stdlib `sqlite3` has no hook on fsync, so the simulator derives what would survive power loss from SQLite's documentation of `synchronous=FULL` in WAL mode. It doesn't test whether a disk honours a sync.
 - **WAL checkpoint crashes are not covered.** Auto-checkpointing is off in the simulator, so crashes during a checkpoint and torn pages in the main database file are outside what's tested.
 - **A clean run isn't a proof.** Results hold for the fault model, the workload and the seeds reported. The invariants and the engine share an author, and threads take turns, so real parallelism is tested only by the process-death test.
-- **Wall-clock backoff.** A forward clock jump can shorten a backoff.
-- **Crash loops are unbounded.** Crashes don't use up retry attempts, by design.
+- **Wall-clock backoff and key age.** A forward clock jump can shorten a backoff. Key age is also measured on the wall clock, so a backward jump could make an old key look young enough to trust a "no record" from a provider that has forgotten it. The reasoning says this hole exists; the simulator has never reached it.
+- **A person can be wrong.** While the status lookup is down, **It did not happen** is accepted with nothing to check it against, even if the refund exists. **It happened** is accepted whenever the provider has no record, which is the point when it has forgotten the key and an error when the refund never went out. Either way the run's record names the person who decided.
+- **The provider is still a mock.** It now lies, goes stale, loses its status lookup and forgets keys, but only in the ways the simulator's author thought of, and `KEY_TRUST_S` assumes a retention window that a real provider would have to document.
 - **Simulated integrations.** Orders, customers, the payment ledger and notifications are local mocks in the same SQLite file. There are no real payments, messages or external APIs.
-- **Ephemeral public demo.** Render's free tier has no persistent disk, so the database is wiped on every deploy, restart and idle spin-down. The live demo does not demonstrate recovery across a restart; the process-death recovery is shown by the test against a surviving local database.
-- **Manual recovery.** Nothing scans for and resumes stuck runs, and there is no reconciliation for `outcome_unknown` runs.
-- **Shared, unauthenticated demo.** Anyone can create, approve, reject or resume any run; `decided_by` is free text.
+- **Ephemeral public demo.** Render's free tier has no persistent disk, so the database is wiped on every deploy, restart and idle spin-down. The live demo does not demonstrate recovery across a restart; the process-death recovery is shown by the tests against a surviving local database.
+- **One worker, in the API process.** Recovery runs only while the server is up, and a free Render service sleeps when idle, so a run abandoned there waits until the next visit wakes it.
+- **Shared, unauthenticated demo.** Anyone can create, approve, reject, resume or settle any run; `decided_by` is free text.
 - **Single SQLite process.** The lease guards concurrent callers on one database file. This is not a distributed system, and there are no performance or scale measurements.
-- **UI gaps.** The run list shows `outcome_unknown` runs as `Failed` (the list endpoint carries no events), the UI doesn't poll, and the frontend has no automated tests in the repository; it is checked by the TypeScript build and by browser runs against a local backend.
+- **UI gaps.** The UI doesn't poll, and the frontend has no automated tests in the repository; it is checked by the TypeScript build and by browser runs.
