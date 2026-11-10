@@ -36,6 +36,7 @@ class Proc:
         self.schema_current_at_open = False
         self.clock_read_us: int | None = None  # True time of this process's latest clock read.
         self.read_before_tx_us: int | None = None  # The same, as it stood when its transaction began.
+        self.tx_began_us: int | None = None  # True time its latest transaction began.
         self.claims: dict[str, int] = {}
 
 

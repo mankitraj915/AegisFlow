@@ -110,6 +110,7 @@ class Checker:
     def statement(self, proc: Proc, verb: str) -> None:
         if verb == "BEGIN":
             proc.read_before_tx_us = proc.clock_read_us
+            proc.tx_began_us = self.world.sched.true_us
         if proc.readonly and verb in WRITE_VERBS and proc.schema_current_at_open:
             self.fail("read_path_writes", f"{proc.name} ran {verb} on a read-only path")
 
@@ -189,20 +190,21 @@ class Checker:
 
     def _check_takeover(self, run_id: str, old: dict | None, token: str, proc: Proc | None) -> None:
         """A lease may only be taken from a holder that let it go or whose time is up.
-        Both clock reads came before their transactions, which is what the engine compared."""
+        The engine reads the clock for a claim inside the claiming transaction, so the holder's
+        read came no earlier than its transaction began, and the taker's no later than now."""
         now = self.world.sched.true_us
         if proc is None:  # Restored from disk after a power loss: this lease was taken back then.
             self.lease_read_at.setdefault((run_id, token), now)
             return
-        read_at = proc.read_before_tx_us if proc.read_before_tx_us is not None else now
-        self.lease_read_at[(run_id, token)] = read_at
+        claimed_from = proc.tx_began_us if proc.tx_began_us is not None else now
+        self.lease_read_at[(run_id, token)] = claimed_from
         if old is None or not old["lease_token"]:
             return
         held_since = self.lease_read_at[(run_id, old["lease_token"])]
         # A forward clock jump can really expire a lease early, as documented.
         jumped = any(held_since <= t <= now for t in self.forward_jumps)
-        if read_at - held_since < LEASE_US and not jumped:
-            self.fail("two_drivers", f"{run_id[:8]} claimed {(read_at - held_since) // 1000} ms after a driver "
+        if now - held_since < LEASE_US and not jumped:
+            self.fail("two_drivers", f"{run_id[:8]} claimed {(now - held_since) // 1000} ms after a driver "
                       "that still held it")
 
     def tool_started(self, proc: Proc, name: str, key: str) -> None:

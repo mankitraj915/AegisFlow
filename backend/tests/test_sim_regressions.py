@@ -61,7 +61,8 @@ def test_discovery_seeds_stay_clean(seed):
 
 # Checker mistakes the simulator exposed: (mistake, seed that reported a false failure).
 @pytest.mark.parametrize("mistake,seed", [("backoff_timed_from_commit", 1750), ("schema_judged_per_statement", 4),
-                                                  ("lease_timed_from_restart", 1)])
+                                                  ("lease_timed_from_restart", 1),
+                                                  ("lease_timed_from_commit", 2935)])
 def test_seed_that_exposed_a_checker_mistake_stays_clean(mistake, seed):
     assert simulate(seed).failures() == []
     with applied(mistake):
